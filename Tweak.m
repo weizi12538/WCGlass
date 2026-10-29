@@ -6,6 +6,7 @@
 #import <sys/utsname.h>
 
 #define WG_SUITE @"com.wcglass.prefs"
+#define TAG_GLASS_TOP   0x57A01
 #define TAG_GLASS_INPUT 0x57A02
 #define TAG_GLASS_TAB   0x57A03
 #define TAG_TAB_PILL    0x57A04
@@ -13,7 +14,9 @@
 #define TAG_DRAWER      0x57A06
 #define TAG_DIM         0x57A07
 
-static __weak UITabBarController *gTab;
+static __weak UIViewController *gTab;
+static __weak UIView *gTabBar;
+static UIViewController *WGVisibleVC(void);
 static int gCntChat, gCntTab;
 static BOOL gHookChat, gHookTab, gHookSet;
 static UIView *WGFindInputBar(UIView *root);
@@ -49,8 +52,13 @@ static UIVisualEffectView *WGBlur(CGFloat radius, BOOL glass) {
     if (glass && g) eff = [[g alloc] init];
     if (!eff) eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial];
     UIVisualEffectView *v = [[UIVisualEffectView alloc] initWithEffect:eff];
+    v.contentView.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
+        return t.userInterfaceStyle == UIUserInterfaceStyleDark ? [UIColor colorWithWhite:1 alpha:0.06]
+                                                                : [UIColor colorWithWhite:1 alpha:0.38];
+    }];
     v.layer.cornerRadius = radius;
     v.layer.cornerCurve = kCACornerCurveContinuous;
+    if (radius > 0) { v.layer.borderWidth = 0.6; v.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.5].CGColor; }
     v.clipsToBounds = YES;
     v.userInteractionEnabled = NO;
     return v;
@@ -74,11 +82,10 @@ static UIWindow *WGWindow(void) {
 }
 
 static UINavigationController *WGNav(void) {
-    UIViewController *sel = gTab.selectedViewController;
-    if ([sel isKindOfClass:UINavigationController.class]) return (UINavigationController *)sel;
-    return sel.navigationController;
+    UIViewController *v = WGVisibleVC();
+    if ([v isKindOfClass:UINavigationController.class]) return (UINavigationController *)v;
+    return v.navigationController;
 }
-
 
 #pragma mark - 诊断
 
@@ -97,11 +104,22 @@ static UIViewController *WGTopVC(void) {
 
 static UIViewController *WGVisibleVC(void) {
     UIViewController *v = WGWindow().rootViewController;
-    for (int i = 0; i < 10 && v; i++) {
-        if (v.presentedViewController) v = v.presentedViewController;
-        else if ([v isKindOfClass:UITabBarController.class]) v = ((UITabBarController *)v).selectedViewController;
-        else if ([v isKindOfClass:UINavigationController.class]) v = ((UINavigationController *)v).topViewController;
-        else break;
+    for (int i = 0; i < 12 && v; i++) {
+        if (v.presentedViewController) { v = v.presentedViewController; continue; }
+        if ([v isKindOfClass:UINavigationController.class]) {
+            UIViewController *t = ((UINavigationController *)v).topViewController;
+            if (!t) break;
+            v = t; continue;
+        }
+        if ([v respondsToSelector:NSSelectorFromString(@"selectedViewController")]) {
+            id sel = nil;
+            @try { sel = [v valueForKey:@"selectedViewController"]; } @catch (__unused NSException *e) {}
+            if ([sel isKindOfClass:UIViewController.class]) { v = sel; continue; }
+        }
+        UIViewController *nx = nil;
+        for (UIViewController *c in v.childViewControllers) if ([c isKindOfClass:UINavigationController.class]) nx = c;
+        if (nx) { v = nx; continue; }
+        break;
     }
     return v;
 }
@@ -133,13 +151,24 @@ static NSString *WGDiagnose(void) {
     UIWindow *w = WGWindow();
     [s appendFormat:@"root: %@\n", w.rootViewController ? WGChain(w.rootViewController) : @"nil"];
     if (gTab) {
-        UITabBar *b = gTab.tabBar;
-        [s appendFormat:@"tabVC: %@\ntabBar: %@ hidden=%d %@\n", WGChain(gTab), NSStringFromClass(b.class), b.hidden, NSStringFromCGRect(b.frame)];
-        NSMutableArray *names = [NSMutableArray array];
-        for (UIView *v in b.subviews) [names addObject:NSStringFromClass(v.class)];
-        [s appendFormat:@"tabBar子视图: %@\n", [names componentsJoinedByString:@", "]];
+        [s appendFormat:@"tabVC: %@\n", WGChain(gTab)];
+        UIView *b = gTabBar;
+        if (b) {
+            [s appendFormat:@"底栏视图: %@ hidden=%d %@\n", NSStringFromClass(b.class), b.hidden, NSStringFromCGRect(b.frame)];
+            NSMutableArray *names = [NSMutableArray array];
+            for (UIView *v in b.subviews) [names addObject:NSStringFromClass(v.class)];
+            [s appendFormat:@"底栏子视图: %@\n", [names componentsJoinedByString:@", "]];
+        } else [s appendString:@"底栏视图: 没找到\n"];
     } else {
         [s appendString:@"gTab=nil (底栏钩子没触发)\n"];
+    }
+    NSMutableArray *kids = [NSMutableArray array];
+    for (UIViewController *c in w.rootViewController.childViewControllers) [kids addObject:NSStringFromClass(c.class)];
+    [s appendFormat:@"root子VC: %@\n", [kids componentsJoinedByString:@", "]];
+    {
+        [s appendString:@"窗口底部大视图:\n"];
+        int n = 0;
+        if (w) WGBottomViews(w, w, 0, s, &n);
     }
     UIViewController *top = WGVisibleVC();
     [s appendFormat:@"当前页VC: %@\n", top ? WGChain(top) : @"nil"];
@@ -363,7 +392,7 @@ static void WGShowDiag(void) {
 
 - (void)rowTapped:(UIButton *)b {
     NSInteger t = b.tag;
-    if (t <= 3) { gTab.selectedIndex = t; [self closeDrawer]; }
+    if (t <= 3) { @try { [gTab setValue:@(t) forKey:@"selectedIndex"]; } @catch (__unused NSException *e) {} [self closeDrawer]; }
     else if (t == 10) {
         [self closeDrawer];
         @try {
@@ -397,24 +426,39 @@ static UIView *WGFindInputBar(UIView *root) {
 
 static void WGApplyChat(UIViewController *vc) {
     if (!vc.isViewLoaded) return;
+    UIView *root = vc.view;
 
-    if ([WGD() boolForKey:@"glassTop"]) {
+    // ---- 顶栏毛玻璃 ----
+    UIView *topGlass = [root viewWithTag:TAG_GLASS_TOP];
+    UINavigationBar *nb = vc.navigationController.navigationBar;
+    if ([WGD() boolForKey:@"glassTop"] && nb && !nb.hidden) {
         UINavigationBarAppearance *ap = [UINavigationBarAppearance new];
         [ap configureWithTransparentBackground];
-        ap.backgroundEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
         vc.navigationItem.standardAppearance = ap;
         vc.navigationItem.scrollEdgeAppearance = ap;
         vc.navigationItem.compactAppearance = ap;
+        nb.backgroundColor = UIColor.clearColor;
+        for (UIView *sv in nb.subviews)
+            if ([NSStringFromClass(sv.class) containsString:@"Background"]) sv.alpha = 0;
+        CGRect r = [root convertRect:nb.bounds fromView:nb];
+        CGFloat h = CGRectGetMaxY(r);
+        if (h > 1) {
+            if (!topGlass) { topGlass = WGBlur(0, NO); topGlass.tag = TAG_GLASS_TOP; [root addSubview:topGlass]; }
+            topGlass.frame = CGRectMake(0, 0, root.bounds.size.width, h);
+            [root bringSubviewToFront:topGlass];
+        }
+    } else {
+        [topGlass removeFromSuperview];
     }
 
-    UIView *root = vc.view;
+    // ---- 输入框玻璃 ----
     UIView *bar = WGFindInputBar(root);
     if (!bar) return;
     UIView *pill = [bar viewWithTag:TAG_GLASS_INPUT];
     if (![WGD() boolForKey:@"glassInput"]) { [pill removeFromSuperview]; return; }
 
     if (!pill) {
-        pill = WGBlur(0, YES);
+        pill = WGBlur(20, NO);
         pill.tag = TAG_GLASS_INPUT;
         pill.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [bar insertSubview:pill atIndex:0];
@@ -423,10 +467,14 @@ static void WGApplyChat(UIViewController *vc) {
     pill.frame = b;
     pill.layer.cornerRadius = b.size.height / 2;
     bar.backgroundColor = UIColor.clearColor;
-    for (UIView *sv in bar.subviews) {
-        if (sv == pill) continue;
-        if (sv.bounds.size.width >= bar.bounds.size.width * 0.9 && sv.subviews.count == 0 &&
-            ![sv isKindOfClass:UIControl.class] && ![sv isKindOfClass:UILabel.class]) sv.alpha = 0; // 原背景 / 分割线
+    // 去掉微信自带的整条背景(容器上的全宽毛玻璃 / 背景图 / 分割线)
+    for (UIView *host in @[bar, bar.superview ?: bar]) {
+        for (UIView *sv in host.subviews) {
+            if (sv == pill || sv == bar) continue;
+            BOOL wide = sv.bounds.size.width >= root.bounds.size.width * 0.9;
+            BOOL plain = sv.subviews.count == 0 && ![sv isKindOfClass:UIControl.class] && ![sv isKindOfClass:UILabel.class];
+            if (wide && (plain || [sv isKindOfClass:UIVisualEffectView.class])) sv.alpha = 0;
+        }
     }
     UIView *tv = WGFind(bar, ^BOOL(UIView *v) { return [v isKindOfClass:UITextView.class]; });
     if (tv) {
@@ -449,19 +497,30 @@ static void n_chatAppear(UIViewController *self, SEL _cmd, BOOL animated) {
     WGApplyChat(self);
 }
 
-#pragma mark - 首页底栏
+#pragma mark - 首页底栏(微信用的是自定义 WCTabBarController,不是 UITabBarController)
 
-static void WGApplyTab(UITabBarController *tc) {
+static UIView *WGFindTabBar(UIView *root) {
+    CGFloat W = root.bounds.size.width, H = root.bounds.size.height;
+    BOOL (^ok)(UIView *) = ^BOOL(UIView *v) {
+        if (v.tag >= TAG_GLASS_TOP && v.tag <= TAG_DIM) return NO;
+        NSString *n = NSStringFromClass(v.class);
+        if ([n hasPrefix:@"UI"] || [n hasPrefix:@"_UI"]) return NO;
+        CGRect f = [root convertRect:v.bounds fromView:v];
+        return f.size.width > W * 0.8 && f.size.height >= 40 && f.size.height < 170 && CGRectGetMaxY(f) > H - 130;
+    };
+    UIView *hit = WGFind(root, ^BOOL(UIView *v) {
+        return [NSStringFromClass(v.class) localizedCaseInsensitiveContainsString:@"tabbar"] && ok(v);
+    });
+    if (hit) return hit;
+    for (UIView *v in root.subviews) if (ok(v) && v.subviews.count >= 3) return v;
+    return nil;
+}
+
+static void WGApplyTab(UIViewController *tc) {
     gTab = tc;
     UIView *root = tc.view;
-    UITabBar *bar = tc.tabBar;
-    NSInteger style = [WGD() integerForKey:@"tabStyle"];
-    UIView *glass = [root viewWithTag:TAG_GLASS_TAB];
-    UIView *pill = [root viewWithTag:TAG_TAB_PILL];
-    UIButton *plus = (UIButton *)[root viewWithTag:TAG_TAB_PLUS];
 
-    // 手势只加一次
-    static char kEdge;
+    static char kEdge, kOrig;
     if (!objc_getAssociatedObject(tc, &kEdge)) {
         UIScreenEdgePanGestureRecognizer *e = [[UIScreenEdgePanGestureRecognizer alloc] initWithTarget:WGHelper.shared action:@selector(edgePan:)];
         e.edges = UIRectEdgeLeft;
@@ -472,63 +531,77 @@ static void WGApplyTab(UITabBarController *tc) {
     if (root.window && (NSInteger)root.window.overrideUserInterfaceStyle != theme)
         root.window.overrideUserInterfaceStyle = (UIUserInterfaceStyle)theme;
 
-    UINavigationController *nav = [tc.selectedViewController isKindOfClass:UINavigationController.class] ? (UINavigationController *)tc.selectedViewController : nil;
-    BOOL barGone = bar.isHidden || nav.topViewController.hidesBottomBarWhenPushed || nav.viewControllers.count > 1;
+    NSInteger style = [WGD() integerForKey:@"tabStyle"];
+    UIView *bar = gTabBar;
+    if (!bar || ![bar isDescendantOfView:root]) { bar = WGFindTabBar(root); gTabBar = bar; }
 
-    if (style == 0) { [glass removeFromSuperview]; [pill removeFromSuperview]; [plus removeFromSuperview]; return; }
-    glass.hidden = pill.hidden = plus.hidden = barGone;
-    if (barGone) return;
+    UIView *glass = [root viewWithTag:TAG_GLASS_TAB];
+    UIView *pill = [root viewWithTag:TAG_TAB_PILL];
+    UIView *plus = [root viewWithTag:TAG_TAB_PLUS];
 
-    static char kAp;
-    if (!objc_getAssociatedObject(bar, &kAp)) {
-        UITabBarAppearance *ap = [UITabBarAppearance new];
-        [ap configureWithTransparentBackground];
-        bar.standardAppearance = ap;
-        bar.scrollEdgeAppearance = ap;
-        objc_setAssociatedObject(bar, &kAp, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (style == 0 || !bar) {
+        [glass removeFromSuperview]; [pill removeFromSuperview]; [plus removeFromSuperview];
+        NSValue *o = objc_getAssociatedObject(bar, &kOrig);
+        if (bar && o) { bar.frame = o.CGRectValue; objc_setAssociatedObject(bar, &kOrig, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+        return;
     }
+    BOOL gone = bar.hidden || bar.alpha < 0.01 || !bar.window;
+    glass.hidden = pill.hidden = plus.hidden = gone;
+    if (gone) return;
+
+    if (!objc_getAssociatedObject(bar, &kOrig))
+        objc_setAssociatedObject(bar, &kOrig, [NSValue valueWithCGRect:bar.frame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     CGFloat W = root.bounds.size.width, H = root.bounds.size.height;
-    CGFloat h = 64, m = 14, y = H - MAX(root.safeAreaInsets.bottom, 10) - h;
-    CGFloat plusSize = h;
+    CGFloat h = 64, m = 14, plusSize = h;
+    CGFloat y = H - MAX(root.safeAreaInsets.bottom, 10) - h;
     CGFloat cw = style == 1 ? W - m * 3 - plusSize : W - m * 2;
-    CGRect cap = CGRectMake(m, y, cw, h);
+    UIView *host = bar.superview;
+    CGRect cap = [host convertRect:CGRectMake(m, y, cw, h) fromView:root];
 
-    if (!glass) {
-        glass = WGBlur(h / 2, YES);
-        glass.tag = TAG_GLASS_TAB;
-    }
-    if (glass.superview != root) [root insertSubview:glass belowSubview:bar];
+    if (!glass) { glass = WGBlur(h / 2, NO); glass.tag = TAG_GLASS_TAB; }
+    if (glass.superview != host) [host insertSubview:glass belowSubview:bar];
     glass.frame = cap;
-    ((UIVisualEffectView *)glass).layer.cornerRadius = h / 2;
+    glass.layer.cornerRadius = h / 2;
     bar.frame = cap;
     bar.backgroundColor = UIColor.clearColor;
+    for (UIView *sv in bar.subviews) {
+        BOOL wide = sv.bounds.size.width >= bar.bounds.size.width * 0.9;
+        if (wide && (sv.subviews.count == 0 || [sv isKindOfClass:UIVisualEffectView.class]) && ![sv isKindOfClass:UIControl.class]) sv.alpha = 0;
+    }
 
-    // 找到每个 tab 按钮
-    NSMutableArray<UIView *> *btns = [NSMutableArray array];
-    for (UIView *s in bar.subviews) if ([NSStringFromClass(s.class) containsString:@"TabBarButton"]) [btns addObject:s];
-    [btns sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) { return a.frame.origin.x < b.frame.origin.x ? NSOrderedAscending : NSOrderedDescending; }];
+    // 找到每个 tab 项
+    NSMutableArray<UIView *> *items = [NSMutableArray array];
+    for (UIView *sv in bar.subviews) {
+        if (sv.hidden || sv.alpha < 0.01 || sv.tag == TAG_TAB_PILL) continue;
+        if (sv.bounds.size.width < bar.bounds.size.width * 0.45 && sv.bounds.size.height >= 30) [items addObject:sv];
+    }
+    [items sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) { return a.frame.origin.x < b.frame.origin.x ? NSOrderedAscending : NSOrderedDescending; }];
 
     // 样式一:只显示图标
-    for (UIView *b in btns)
-        for (UIView *s in b.subviews)
-            if ([NSStringFromClass(s.class) containsString:@"Label"]) s.hidden = (style == 1);
+    for (UIView *it in items) for (UIView *sv in it.subviews) if ([sv isKindOfClass:UILabel.class]) sv.hidden = (style == 1);
 
     // 样式二:选中项高亮胶囊
-    if (style == 2 && btns.count) {
-        NSInteger idx = MIN((NSInteger)btns.count - 1, MAX(0, tc.selectedIndex));
-        UIView *sel = btns[idx];
-        CGRect pf = CGRectInset(CGRectOffset(sel.frame, bar.frame.origin.x, bar.frame.origin.y), 2, 6);
-        if (!pill) {
-            pill = [UIView new];
-            pill.tag = TAG_TAB_PILL;
-            pill.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.22];
-            pill.userInteractionEnabled = NO;
-            pill.frame = pf;
+    if (style == 2 && items.count >= 3 && items.count <= 5) {
+        NSInteger idx = -1;
+        @try { idx = [[tc valueForKey:@"selectedIndex"] integerValue]; } @catch (__unused NSException *e) {}
+        if (idx < 0 || idx >= (NSInteger)items.count) {
+            for (NSUInteger i = 0; i < items.count; i++)
+                if ([items[i] isKindOfClass:UIControl.class] && ((UIControl *)items[i]).selected) idx = i;
         }
-        if (pill.superview != root) [root insertSubview:pill belowSubview:bar];
-        pill.layer.cornerRadius = pf.size.height / 2;
-        [UIView animateWithDuration:0.25 animations:^{ pill.frame = pf; }];
+        if (idx >= 0 && idx < (NSInteger)items.count) {
+            CGRect pf = CGRectInset([host convertRect:items[idx].frame fromView:bar], 2, 7);
+            if (!pill) {
+                pill = [UIView new];
+                pill.tag = TAG_TAB_PILL;
+                pill.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.22];
+                pill.userInteractionEnabled = NO;
+                pill.frame = pf;
+            }
+            if (pill.superview != host) [host insertSubview:pill belowSubview:bar];
+            pill.layer.cornerRadius = pf.size.height / 2;
+            [UIView animateWithDuration:0.25 animations:^{ pill.frame = pf; }];
+        } else [pill removeFromSuperview];
     } else {
         [pill removeFromSuperview];
     }
@@ -540,8 +613,8 @@ static void WGApplyTab(UITabBarController *tc) {
             plus.tag = TAG_TAB_PLUS;
             plus.backgroundColor = UIColor.blackColor;
             plus.tintColor = UIColor.whiteColor;
-            [plus setImage:[UIImage systemImageNamed:@"plus" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:24 weight:UIImageSymbolWeightMedium]] forState:UIControlStateNormal];
-            [plus addTarget:WGHelper.shared action:@selector(plusTapped) forControlEvents:UIControlEventTouchUpInside];
+            [(UIButton *)plus setImage:[UIImage systemImageNamed:@"plus" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:24 weight:UIImageSymbolWeightMedium]] forState:UIControlStateNormal];
+            [(UIButton *)plus addTarget:WGHelper.shared action:@selector(plusTapped) forControlEvents:UIControlEventTouchUpInside];
         }
         if (plus.superview != root) [root addSubview:plus];
         plus.frame = CGRectMake(W - m - plusSize, y, plusSize, plusSize);
@@ -556,7 +629,7 @@ static void WGApplyTab(UITabBarController *tc) {
 }
 
 static IMP o_tabLayout;
-static void n_tabLayout(UITabBarController *self, SEL _cmd) {
+static void n_tabLayout(UIViewController *self, SEL _cmd) {
     ((void(*)(id, SEL))o_tabLayout)(self, _cmd);
     gCntTab++;
     WGApplyTab(self);
@@ -598,8 +671,13 @@ __attribute__((constructor)) static void WGInit(void) {
         o_chatAppear = WGHook(c, @selector(viewWillAppear:), (IMP)n_chatAppear);
     }
     // 首页 TabBarController
-    Class tc = NSClassFromString(@"MMTabBarController") ?: UITabBarController.class;
-    o_tabLayout = WGHook(tc, @selector(viewDidLayoutSubviews), (IMP)n_tabLayout);
+    Class tcc = nil;
+    for (NSString *n in @[@"NewMainTabBarViewController", @"WCTabBarController", @"MMTabBarController"]) {
+        tcc = NSClassFromString(n);
+        if (tcc) break;
+    }
+    if (!tcc) tcc = UITabBarController.class;
+    o_tabLayout = WGHook(tcc, @selector(viewDidLayoutSubviews), (IMP)n_tabLayout);
 
     gHookChat = o_chatLayout != NULL;
     gHookTab = o_tabLayout != NULL;
