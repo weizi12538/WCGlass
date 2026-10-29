@@ -16,6 +16,8 @@
 
 static __weak UIViewController *gTab;
 static __weak UIView *gTabBar;
+static __weak UIView *gTopBar;
+static NSString *gTopInfo;
 static UIViewController *WGVisibleVC(void);
 static int gCntChat, gCntTab;
 static BOOL gHookChat, gHookTab, gHookSet;
@@ -262,9 +264,11 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
 @property (nonatomic, copy) void (^onBack)(void);
 @property (nonatomic, copy) void (^onInfo)(void);
 @property (nonatomic, copy) NSString *title;
+@property (nonatomic, strong) UIColor *coverColor;
 @end
 
 @implementation WGTopBar {
+    UIView *_cover;
     UIVisualEffectView *_l, *_c, *_r;
     UIImageView *_chev, *_menu;
     UILabel *_back, *_t1, *_t2;
@@ -282,6 +286,8 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
 
 - (instancetype)initWithFrame:(CGRect)f {
     if (!(self = [super initWithFrame:f])) return nil;
+    _cover = [UIView new];
+    [self addSubview:_cover];
     _l = WGBlur(21.5, NO); _c = WGBlur(21.5, NO); _r = WGBlur(21.5, NO);
     [self addSubview:_l]; [self addSubview:_c]; [self addSubview:_r];
 
@@ -329,6 +335,11 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
     _t1.text = title.length ? title : WGL(@"聊天", @"Chat");
 }
 
+- (void)setCoverColor:(UIColor *)c {
+    _coverColor = c;
+    _cover.backgroundColor = c;
+}
+
 - (void)updateSeg {
     _t1.textColor = _idx == 0 ? UIColor.labelColor : UIColor.secondaryLabelColor;
     _t2.textColor = _idx == 1 ? UIColor.labelColor : UIColor.secondaryLabelColor;
@@ -337,6 +348,7 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat W = self.bounds.size.width, H = self.bounds.size.height, h = 43, y = (H - h) / 2, m = 16, cw = 157;
+    _cover.frame = self.bounds;
     _l.frame = CGRectMake(m, y, 78, h);
     _c.frame = CGRectMake((W - cw) / 2, y, cw, h);
     _r.frame = CGRectMake(W - m - h, y, h, h);
@@ -435,6 +447,7 @@ static NSString *WGDiagnose(void) {
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"钩子: chat=%d tab=%d setting=%d\n", gHookChat, gHookTab, gHookSet];
     [s appendFormat:@"触发次数: chat=%d tab=%d\n", gCntChat, gCntTab];
+    [s appendFormat:@"%@\n", gTopInfo ?: @"顶栏: 还没执行过"];
     [s appendFormat:@"类存在: MMTabBarController=%d BaseMsgContent=%d\n",
         NSClassFromString(@"MMTabBarController") != nil, NSClassFromString(@"BaseMsgContentViewController") != nil];
     UIWindow *w = WGWindow();
@@ -581,13 +594,13 @@ static void WGShowDiag(void) {
 - (UIControl *)rowIn:(UIView *)c y:(CGFloat)y w:(CGFloat)w icon:(NSString *)sym title:(NSString *)title tag:(NSInteger)tag {
     UIControl *r = [[UIControl alloc] initWithFrame:CGRectMake(0, y, w, 48)];
     r.tag = tag;
-    UIImageView *iv = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:sym withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightRegular]]];
+    UIImageView *iv = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:sym withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:19 weight:UIImageSymbolWeightRegular]]];
     iv.tintColor = UIColor.labelColor;
     iv.contentMode = UIViewContentModeScaleAspectFit;
-    iv.frame = CGRectMake(24, 10, 30, 28);
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(70, 0, w - 90, 48)];
+    iv.frame = CGRectMake(24, 10, 26, 28);
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(62, 0, w - 80, 48)];
     l.text = title;
-    l.font = [UIFont systemFontOfSize:19 weight:UIFontWeightMedium];
+    l.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     [r addSubview:iv]; [r addSubview:l];
     [r addTarget:self action:@selector(rowTapped:) forControlEvents:UIControlEventTouchUpInside];
     [c addSubview:r];
@@ -624,12 +637,12 @@ static void WGShowDiag(void) {
     av.layer.shadowOpacity = 0.25; av.layer.shadowRadius = 5; av.layer.shadowOffset = CGSizeMake(0, 2);
     [dr addSubview:av];
     UILabel *nm = [[UILabel alloc] initWithFrame:CGRectMake(96, top + 22, dw - 96 - 64, 28)];
-    nm.font = [UIFont systemFontOfSize:24 weight:UIFontWeightSemibold];
+    nm.font = [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold];
     nm.text = @"微信";
     [dr addSubview:nm];
     struct utsname u; uname(&u);
     UILabel *info = [[UILabel alloc] initWithFrame:CGRectMake(96, top + 52, dw - 96 - 50, 20)];
-    info.font = [UIFont systemFontOfSize:14];
+    info.font = [UIFont systemFontOfSize:11.5];
     info.textColor = UIColor.secondaryLabelColor;
     info.text = [NSString stringWithFormat:@"%s · iOS %@", u.machine, UIDevice.currentDevice.systemVersion];
     [dr addSubview:info];
@@ -650,9 +663,9 @@ static void WGShowDiag(void) {
 
     // 中英文切换按钮(头像行右侧,和参考图的地球图标一致)
     UIButton *lang = [UIButton buttonWithType:UIButtonTypeSystem];
-    lang.frame = CGRectMake(dw - 18 - 38, top + 30, 38, 38);
+    lang.frame = CGRectMake(dw - 16 - 34, top + 30, 34, 34);
     lang.tintColor = UIColor.labelColor;
-    [lang setImage:[UIImage systemImageNamed:@"globe" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:26 weight:UIImageSymbolWeightLight]] forState:UIControlStateNormal];
+    [lang setImage:[UIImage systemImageNamed:@"globe" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightLight]] forState:UIControlStateNormal];
     [lang addTarget:self action:@selector(toggleLang) forControlEvents:UIControlEventTouchUpInside];
     [dr addSubview:lang];
 
@@ -674,8 +687,8 @@ static void WGShowDiag(void) {
     sc.backgroundColor = UIColor.tertiarySystemFillColor;
     sc.layer.cornerRadius = 19;
     sc.clipsToBounds = YES;
-    [sc setTitleTextAttributes:@{NSForegroundColorAttributeName: UIColor.systemBackgroundColor, NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightMedium]} forState:UIControlStateSelected];
-    [sc setTitleTextAttributes:@{NSForegroundColorAttributeName: UIColor.labelColor, NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightMedium]} forState:UIControlStateNormal];
+    [sc setTitleTextAttributes:@{NSForegroundColorAttributeName: UIColor.systemBackgroundColor, NSFontAttributeName: [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium]} forState:UIControlStateSelected];
+    [sc setTitleTextAttributes:@{NSForegroundColorAttributeName: UIColor.labelColor, NSFontAttributeName: [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium]} forState:UIControlStateNormal];
     [sc addTarget:self action:@selector(themeChanged:) forControlEvents:UIControlEventValueChanged];
     [dr addSubview:sc];
 
@@ -745,10 +758,11 @@ static UIView *WGFindInputBar(UIView *root) {
 }
 
 static void WGCleanupChatTop(UIViewController *vc) {
-    UINavigationBar *nb = vc.navigationController.navigationBar;
-    UIView *tb = [nb.superview viewWithTag:TAG_GLASS_TOP];
+    UIView *tb = gTopBar;
     if (!tb) return;
     [tb removeFromSuperview];
+    gTopBar = nil;
+    UINavigationBar *nb = vc.navigationController.navigationBar;
     for (UIView *sv in nb.subviews) sv.alpha = 1;
 }
 
@@ -773,11 +787,13 @@ static void WGApplyChat(UIViewController *vc) {
     if (!vc.isViewLoaded) return;
     UIView *root = vc.view;
 
-    // ---- 顶栏:返回胶囊 + 分段胶囊 + 菜单圆钮 ----
+    // ---- 顶栏:返回胶囊 + 分段胶囊 + 菜单圆钮(挂在 window 最上层,不受微信导航栏层级影响) ----
     UINavigationBar *nb = vc.navigationController.navigationBar;
-    UIView *nhost = nb.superview;
-    WGTopBar *tb = (WGTopBar *)[nhost viewWithTag:TAG_GLASS_TOP];
-    if ([WGD() boolForKey:@"glassTop"] && nb && nhost && !nb.hidden) {
+    UIWindow *win = vc.view.window;
+    BOOL wantTop = [WGD() boolForKey:@"glassTop"];
+    BOOL onTop = vc.navigationController.topViewController == vc;
+    gTopInfo = [NSString stringWithFormat:@"顶栏: on=%d nb=%@ win=%d onTop=%d", wantTop, nb ? NSStringFromClass(nb.class) : @"nil", win != nil, onTop];
+    if (wantTop && nb && win && onTop && !nb.hidden) {
         NSString *title = vc.navigationItem.title ?: vc.title;
         if (!title.length) {
             // 取导航栏里最靠中间的文字(避免取到左侧返回按钮上的文字)
@@ -793,19 +809,24 @@ static void WGApplyChat(UIViewController *vc) {
             });
             title = best.text;
         }
+        WGTopBar *tb = (WGTopBar *)gTopBar;
         if (!tb) {
             tb = [WGTopBar new];
-            tb.tag = TAG_GLASS_TOP;
             __weak UIViewController *wvc = vc;
             tb.onBack = ^{ [wvc.navigationController popViewControllerAnimated:YES]; };
             tb.onInfo = ^{ WGTriggerRight(wvc); };
-            [nhost addSubview:tb];
+            gTopBar = tb;
         }
+        if (tb.superview != win) [win addSubview:tb];
         if (title.length) tb.title = title;
-        tb.frame = [nhost convertRect:nb.bounds fromView:nb];
-        [nhost bringSubviewToFront:tb];
+        UIColor *bg = vc.view.backgroundColor;
+        if (!bg || CGColorGetAlpha(bg.CGColor) < 0.5) bg = UIColor.systemBackgroundColor;
+        tb.coverColor = bg;
+        tb.frame = [win convertRect:nb.bounds fromView:nb];
+        [win bringSubviewToFront:tb];
         nb.backgroundColor = UIColor.clearColor;
         for (UIView *sv in nb.subviews) sv.alpha = 0;
+        gTopInfo = [gTopInfo stringByAppendingFormat:@" tb=%@", NSStringFromCGRect(tb.frame)];
     } else {
         WGCleanupChatTop(vc);
     }
