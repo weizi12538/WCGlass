@@ -14,6 +14,9 @@
 #define TAG_DIM         0x57A07
 
 static __weak UITabBarController *gTab;
+static int gCntChat, gCntTab;
+static BOOL gHookChat, gHookTab, gHookSet;
+static UIView *WGFindInputBar(UIView *root);
 
 #pragma mark - 配置
 
@@ -83,6 +86,93 @@ static UINavigationController *WGNav(void) {
     return sel.navigationController;
 }
 
+
+#pragma mark - 诊断
+
+static NSString *WGChain(id obj) {
+    NSMutableArray *a = [NSMutableArray array];
+    Class c = [obj class];
+    while (c && a.count < 6) { [a addObject:NSStringFromClass(c)]; c = class_getSuperclass(c); }
+    return [a componentsJoinedByString:@" > "];
+}
+
+static UIViewController *WGTopVC(void) {
+    UIViewController *v = WGWindow().rootViewController;
+    while (v.presentedViewController) v = v.presentedViewController;
+    return v;
+}
+
+static UIViewController *WGVisibleVC(void) {
+    UIViewController *v = WGWindow().rootViewController;
+    for (int i = 0; i < 10 && v; i++) {
+        if (v.presentedViewController) v = v.presentedViewController;
+        else if ([v isKindOfClass:UITabBarController.class]) v = ((UITabBarController *)v).selectedViewController;
+        else if ([v isKindOfClass:UINavigationController.class]) v = ((UINavigationController *)v).topViewController;
+        else break;
+    }
+    return v;
+}
+
+static void WGDumpCapped(UIView *v, int depth, NSMutableString *out) {
+    if (out.length > 40000 || depth > 9) return;
+    [out appendFormat:@"%@%@ %@\n", [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0],
+        NSStringFromClass(v.class), NSStringFromCGRect(v.frame)];
+    for (UIView *s in v.subviews) WGDumpCapped(s, depth + 1, out);
+}
+
+static void WGBottomViews(UIView *root, UIView *v, int depth, NSMutableString *s, int *n) {
+    if (depth > 7 || *n > 14) return;
+    CGRect f = [root convertRect:v.bounds fromView:v];
+    if (v != root && f.size.width > root.bounds.size.width * 0.8 && f.size.height >= 30 && f.size.height < 260 &&
+        CGRectGetMaxY(f) > root.bounds.size.height - 300) {
+        [s appendFormat:@"  %@ %@\n", NSStringFromClass(v.class), NSStringFromCGRect(f)];
+        (*n)++;
+    }
+    for (UIView *x in v.subviews) WGBottomViews(root, x, depth + 1, s, n);
+}
+
+static NSString *WGDiagnose(void) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"钩子: chat=%d tab=%d setting=%d\n", gHookChat, gHookTab, gHookSet];
+    [s appendFormat:@"触发次数: chat=%d tab=%d\n", gCntChat, gCntTab];
+    [s appendFormat:@"类存在: MMTabBarController=%d BaseMsgContent=%d\n",
+        NSClassFromString(@"MMTabBarController") != nil, NSClassFromString(@"BaseMsgContentViewController") != nil];
+    UIWindow *w = WGWindow();
+    [s appendFormat:@"root: %@\n", w.rootViewController ? WGChain(w.rootViewController) : @"nil"];
+    if (gTab) {
+        UITabBar *b = gTab.tabBar;
+        [s appendFormat:@"tabVC: %@\ntabBar: %@ hidden=%d %@\n", WGChain(gTab), NSStringFromClass(b.class), b.hidden, NSStringFromCGRect(b.frame)];
+        NSMutableArray *names = [NSMutableArray array];
+        for (UIView *v in b.subviews) [names addObject:NSStringFromClass(v.class)];
+        [s appendFormat:@"tabBar子视图: %@\n", [names componentsJoinedByString:@", "]];
+    } else {
+        [s appendString:@"gTab=nil (底栏钩子没触发)\n"];
+    }
+    UIViewController *top = WGVisibleVC();
+    [s appendFormat:@"当前页VC: %@\n", top ? WGChain(top) : @"nil"];
+    if (top.isViewLoaded) {
+        UIView *bar = WGFindInputBar(top.view);
+        [s appendFormat:@"识别到输入栏: %@\n", bar ? NSStringFromClass(bar.class) : @"无"];
+        [s appendString:@"底部大视图:\n"];
+        int n = 0;
+        WGBottomViews(top.view, top.view, 0, s, &n);
+        UINavigationBar *nb = top.navigationController.navigationBar;
+        if (nb) [s appendFormat:@"navBar: %@ hidden=%d %@\n", NSStringFromClass(nb.class), nb.hidden, NSStringFromCGRect(nb.frame)];
+    }
+    NSMutableString *full = [s mutableCopy];
+    [full appendString:@"\n---- 视图层级 ----\n"];
+    if (w) WGDumpCapped(w, 0, full);
+    UIPasteboard.generalPasteboard.string = full;
+    return s;
+}
+
+static void WGShowDiag(void) {
+    NSString *s = WGDiagnose();
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"诊断(完整信息已复制)" message:s preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [WGTopVC() presentViewController:a animated:YES completion:nil];
+}
+
 #pragma mark - 插件面板
 
 @interface WGPanelVC : UITableViewController
@@ -92,7 +182,7 @@ static UINavigationController *WGNav(void) {
 - (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
 - (void)viewDidLoad { [super viewDidLoad]; self.title = @"WCGlass"; }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return 2; }
-- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return s == 0 ? 4 : 2; }
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return s == 0 ? 4 : 3; }
 - (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s { return s == 0 ? @"外观" : @"工具"; }
 - (NSString *)tableView:(UITableView *)t titleForFooterInSection:(NSInteger)s {
     return s == 0 ? @"部分开关关闭后需重新进入聊天页或重启微信生效" : nil;
@@ -119,8 +209,9 @@ static UINavigationController *WGNav(void) {
             c.accessoryView = sw;
         }
     } else {
-        c.textLabel.text = ip.row == 0 ? @"导出当前界面视图层级(复制到剪贴板)" : @"恢复默认设置";
-        c.textLabel.textColor = ip.row == 1 ? UIColor.systemRedColor : UIColor.labelColor;
+        NSArray *t2 = @[@"立即诊断(复制到剪贴板)", @"8秒后诊断(切到聊天页用)", @"恢复默认设置"];
+        c.textLabel.text = t2[ip.row];
+        c.textLabel.textColor = ip.row == 2 ? UIColor.systemRedColor : UIColor.labelColor;
     }
     return c;
 }
@@ -132,15 +223,10 @@ static UINavigationController *WGNav(void) {
     [t deselectRowAtIndexPath:ip animated:YES];
     if (ip.section != 1) return;
     if (ip.row == 0) {
-        NSMutableString *s = [NSMutableString string];
-        UIWindow *w = WGWindow();
-        [s appendFormat:@"TopVC: %@\n", NSStringFromClass(WGNav().topViewController.class)];
-        if (w) WGDump(w, 0, s);
-        UIPasteboard.generalPasteboard.string = s;
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已复制"
-            message:@"视图层级已复制到剪贴板,可粘贴出来查看真实类名" preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
+        WGShowDiag();
+    } else if (ip.row == 1) {
+        [t cellForRowAtIndexPath:ip].textLabel.text = @"计时中…请在8秒内切到目标页面";
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ WGShowDiag(); });
     } else {
         for (NSString *k in @[@"glassTop", @"glassInput", @"tabStyle", @"drawer", @"theme"]) [WGD() removeObjectForKey:k];
         [t reloadData];
@@ -362,6 +448,7 @@ static void WGApplyChat(UIViewController *vc) {
 static IMP o_chatLayout, o_chatAppear;
 static void n_chatLayout(UIViewController *self, SEL _cmd) {
     ((void(*)(id, SEL))o_chatLayout)(self, _cmd);
+    gCntChat++;
     WGApplyChat(self);
 }
 static void n_chatAppear(UIViewController *self, SEL _cmd, BOOL animated) {
@@ -478,6 +565,7 @@ static void WGApplyTab(UITabBarController *tc) {
 static IMP o_tabLayout;
 static void n_tabLayout(UITabBarController *self, SEL _cmd) {
     ((void(*)(id, SEL))o_tabLayout)(self, _cmd);
+    gCntTab++;
     WGApplyTab(self);
 }
 
@@ -520,10 +608,14 @@ __attribute__((constructor)) static void WGInit(void) {
     Class tc = NSClassFromString(@"MMTabBarController") ?: UITabBarController.class;
     o_tabLayout = WGHook(tc, @selector(viewDidLayoutSubviews), (IMP)n_tabLayout);
 
+    gHookChat = o_chatLayout != NULL;
+    gHookTab = o_tabLayout != NULL;
+
     // 微信设置页入口
     Class st = NSClassFromString(@"NewSettingViewController");
     if (st) {
         o_settingReload = WGHook(st, NSSelectorFromString(@"reloadTableData"), (IMP)n_settingReload);
         class_addMethod(st, NSSelectorFromString(@"wg_openPanel"), (IMP)n_openPanel, "v@:");
+        gHookSet = o_settingReload != NULL;
     }
 }
