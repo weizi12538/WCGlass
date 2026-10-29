@@ -1,0 +1,16 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Randomblock1/theos-action@v1
+      - name: Build rootful deb
+        run: make clean package FINALPACKAGE=1
+      - name: Build rootless deb
+        run: make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WCGlass-deb
+          path: packages/*.deb
