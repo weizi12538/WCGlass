@@ -65,13 +65,6 @@ static UIView *WGFind(UIView *root, BOOL (^pred)(UIView *v)) {
     return nil;
 }
 
-static void WGDump(UIView *v, int depth, NSMutableString *out) {
-    [out appendFormat:@"%@%@ %@\n",
-        [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0],
-        NSStringFromClass(v.class), NSStringFromCGRect(v.frame)];
-    for (UIView *s in v.subviews) WGDump(s, depth + 1, out);
-}
-
 static UIWindow *WGWindow(void) {
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:UIWindowScene.class]) continue;
