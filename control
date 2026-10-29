@@ -1,0 +1,9 @@
+Package: com.wcglass.tweak
+Name: WCGlass
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: WeChat glass UI: blur top bar, glass input bar, floating tab bar, side drawer, settings panel
+Maintainer: you
+Author: you
+Section: Tweaks
+Depends: firmware (>= 14.0)
