@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sys/utsname.h>
+#import <mach-o/dyld.h>
 
 #define WG_SUITE @"com.wcglass.prefs"
 #define TAG_GLASS_TOP   0x57A01
@@ -18,6 +19,7 @@ static __weak UIViewController *gTab;
 static __weak UIView *gTabBar;
 static __weak UIView *gTopBar;
 static NSString *gTopInfo;
+static BOOL gBarTouched;
 static UIViewController *WGVisibleVC(void);
 static int gCntChat, gCntTab;
 static BOOL gHookChat, gHookTab, gHookSet;
@@ -31,10 +33,26 @@ static NSUserDefaults *WGD(void) {
     dispatch_once(&t, ^{
         d = [[NSUserDefaults alloc] initWithSuiteName:WG_SUITE];
         [d registerDefaults:@{@"glassInput": @YES, @"drawer": @YES, @"theme": @0, @"lang": @0,
-                              @"topStyle": @2, @"botStyle": @5, @"botOn": @YES, @"chipSel": @0,
+                              @"topStyle": @2, @"topOn": @YES, @"liquidManual": @NO, @"botStyle": @5, @"botOn": @YES, @"chipSel": @0,
                               @"glassMode": @0, @"tint": @0.38, @"topCover": @NO, @"segLeft": @"", @"segRight": @""}];
     });
     return d;
+}
+
+// 已加载的同类插件(LiquidUI 等),用来在面板里提示共存状态
+static NSString *WGOtherTweaks(void) {
+    NSMutableArray *hits = [NSMutableArray array];
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *p = _dyld_get_image_name(i);
+        if (!p) continue;
+        NSString *name = [NSString stringWithUTF8String:p].lastPathComponent;
+        NSString *low = name.lowercaseString;
+        if ([low containsString:@"wcglass"]) continue;   // 自己
+        if ([low containsString:@"liquid"] || [low containsString:@"wcg"] || [low containsString:@"glass"])
+            if (![hits containsObject:name]) [hits addObject:name];
+    }
+    return [hits componentsJoinedByString:@", "];
 }
 
 #pragma mark - 工具函数
@@ -766,6 +784,7 @@ static NSString *WGDiagnose(void) {
     [s appendFormat:@"钩子: chat=%d tab=%d setting=%d\n", gHookChat, gHookTab, gHookSet];
     [s appendFormat:@"触发次数: chat=%d tab=%d\n", gCntChat, gCntTab];
     [s appendFormat:@"%@\n", gTopInfo ?: @"顶栏: 还没执行过"];
+    [s appendFormat:@"同类插件: %@\n", WGOtherTweaks().length ? WGOtherTweaks() : @"未检测到"];
     [s appendFormat:@"类存在: MMTabBarController=%d BaseMsgContent=%d\n",
         NSClassFromString(@"MMTabBarController") != nil, NSClassFromString(@"BaseMsgContentViewController") != nil];
     UIWindow *w = WGWindow();
@@ -1166,16 +1185,26 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
     self.title = @"WCGlass";
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     _secs = @[
+        @{@"h": @"与 LiquidUI 等插件共存", @"f": @"原则:同一项功能只让一个插件负责,其余不冲突的功能可以一起用。例如 WCGlass 负责「聊天顶栏」和「首页底栏」时,到 LiquidUI 里把它的「聊天顶栏」「首页底栏」关掉或选原版。LiquidUI 的液态外观、磨砂化、页面渐隐、动效、个性化、首页顶栏、会话分组和 WCGlass 不重叠,可以继续用。", @"rows": @[
+            @{@"t": @"检测状态", @"y": @"st"},
+            @{@"t": @"手动标记:我在用 LiquidUI", @"k": @"liquidManual", @"y": @"sw"}]},
+        @{@"h": @"由 WCGlass 负责的功能", @"f": @"关掉的功能 WCGlass 完全不碰(不改视图、不遮盖),交给别的插件。", @"rows": @[
+            @{@"t": @"聊天顶栏", @"k": @"topOn", @"y": @"sw"},
+            @{@"t": @"首页底栏", @"k": @"botOn", @"y": @"sw"},
+            @{@"t": @"输入框玻璃", @"k": @"glassInput", @"y": @"sw"},
+            @{@"t": @"侧滑侧边栏", @"k": @"drawer", @"y": @"sw"}]},
+        @{@"h": @"一键分工", @"rows": @[
+            @{@"t": @"全部由 WCGlass 负责", @"y": @"p0"},
+            @{@"t": @"只做底栏 + 侧边栏(顶栏、输入框交给 LiquidUI)", @"y": @"p1"},
+            @{@"t": @"只做顶栏 + 输入框(底栏交给 LiquidUI)", @"y": @"p2"},
+            @{@"t": @"WCGlass 全部暂停(全交给 LiquidUI)", @"y": @"p3"}]},
         @{@"h": @"样式", @"rows": @[
             @{@"t": @"聊天顶栏样式", @"y": @"nt"},
             @{@"t": @"首页底栏样式", @"y": @"nb"}]},
         @{@"h": @"聊天顶栏文字", @"f": @"主名称留空=显示聊天对象名。第二文字:Pins 胶囊里是右侧分段(默认「详情」),标题胶囊 / 仿TIM / 名签竖线里是副标题(留空不显示)。", @"rows": @[
             @{@"t": @"主名称", @"k": @"segLeft", @"y": @"tx", @"p": @"留空=聊天对象名"},
             @{@"t": @"第二文字", @"k": @"segRight", @"y": @"tx", @"p": @"留空=默认"}]},
-        @{@"h": @"功能", @"f": @"顶栏默认透明底;如果原来的顶栏还透出来,打开「顶栏显示底板」。", @"rows": @[
-            @{@"t": @"悬浮底栏", @"k": @"botOn", @"y": @"sw"},
-            @{@"t": @"输入框玻璃", @"k": @"glassInput", @"y": @"sw"},
-            @{@"t": @"侧滑侧边栏", @"k": @"drawer", @"y": @"sw"},
+        @{@"h": @"顶栏底板", @"f": @"顶栏默认透明底;如果原来的顶栏还透出来,打开「顶栏显示底板」。", @"rows": @[
             @{@"t": @"顶栏显示底板", @"k": @"topCover", @"y": @"sw"}]},
         @{@"h": @"玻璃材质", @"f": @"液态玻璃需要 iOS 26,系统不支持时自动用毛玻璃。「叠加」是毛玻璃上再叠一层液态玻璃。白度只对毛玻璃和叠加生效。", @"rows": @[
             @{@"t": @"材质", @"k": @"glassMode", @"y": @"sg", @"o": @[@"液态", @"毛玻璃", @"叠加"]},
@@ -1211,6 +1240,11 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
         c.detailTextLabel.text = (i >= 0 && i < (NSInteger)names.count) ? names[i] : @"";
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         c.selectionStyle = UITableViewCellSelectionStyleDefault;
+    } else if ([y isEqualToString:@"st"]) {
+        NSString *o = WGOtherTweaks();
+        c.textLabel.text = o.length ? [NSString stringWithFormat:@"已检测到:%@", o] : @"没检测到 LiquidUI 等插件(如已安装,请手动标记)";
+        c.textLabel.font = [UIFont systemFontOfSize:14];
+        c.textLabel.textColor = o.length ? WGGreen() : UIColor.secondaryLabelColor;
     } else if ([y isEqualToString:@"sw"]) {
         UISwitch *sw = [UISwitch new];
         sw.on = [WGD() boolForKey:k];
@@ -1253,7 +1287,11 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
 }
 
 - (void)swChanged:(UISwitch *)s { [WGD() setBool:s.on forKey:s.accessibilityIdentifier]; WGRefreshAll(); }
-- (void)sgChanged:(UISegmentedControl *)s { [WGD() setInteger:s.selectedSegmentIndex forKey:s.accessibilityIdentifier]; WGRefreshAll(); }
+- (void)sgChanged:(UISegmentedControl *)s {
+    [WGD() setInteger:s.selectedSegmentIndex forKey:s.accessibilityIdentifier];
+    if ([s.accessibilityIdentifier isEqualToString:@"theme"]) WGWindow().overrideUserInterfaceStyle = (UIUserInterfaceStyle)s.selectedSegmentIndex;
+    WGRefreshAll();
+}
 - (void)slChanged:(UISlider *)s { [WGD() setFloat:s.value forKey:s.accessibilityIdentifier]; WGRefreshAll(); }
 - (void)txDone:(UITextField *)t { [WGD() setObject:(t.text ?: @"") forKey:t.accessibilityIdentifier]; }
 - (BOOL)textFieldShouldReturn:(UITextField *)t { [t resignFirstResponder]; return YES; }
@@ -1265,13 +1303,20 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
         [self.navigationController pushViewController:[[WGStylePickerVC alloc] initWithKind:0] animated:YES];
     } else if ([y isEqualToString:@"nb"]) {
         [self.navigationController pushViewController:[[WGStylePickerVC alloc] initWithKind:1] animated:YES];
+    } else if ([y hasPrefix:@"p"] && y.length == 2) {
+        static const BOOL presets[4][4] = {{1, 1, 1, 1}, {0, 1, 0, 1}, {1, 0, 1, 1}, {0, 0, 0, 0}};
+        int idx = [[y substringFromIndex:1] intValue];
+        NSArray *keys = @[@"topOn", @"botOn", @"glassInput", @"drawer"];
+        for (int i = 0; i < 4; i++) [WGD() setBool:presets[idx][i] forKey:keys[i]];
+        [t reloadData];
+        WGRefreshAll();
     } else if ([y isEqualToString:@"b0"]) {
         WGShowDiag();
     } else if ([y isEqualToString:@"b1"]) {
         [t cellForRowAtIndexPath:ip].textLabel.text = @"计时中…请在8秒内切到目标页面";
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ WGShowDiag(); });
     } else if ([y isEqualToString:@"b2"]) {
-        for (NSString *k in @[@"topStyle", @"botStyle", @"botOn", @"glassInput", @"drawer", @"theme", @"lang", @"glassMode", @"tint", @"topCover", @"segLeft", @"segRight", @"chipSel"])
+        for (NSString *k in @[@"topStyle", @"topOn", @"liquidManual", @"botStyle", @"botOn", @"glassInput", @"drawer", @"theme", @"lang", @"glassMode", @"tint", @"topCover", @"segLeft", @"segRight", @"chipSel"])
             [WGD() removeObjectForKey:k];
         [t reloadData];
         WGRefreshAll();
@@ -1569,7 +1614,7 @@ static void WGApplyChat(UIViewController *vc) {
     NSInteger ts = [WGD() integerForKey:@"topStyle"];
     UINavigationBar *nb = vc.navigationController.navigationBar;
     UIWindow *win = vc.view.window;
-    BOOL wantTop = ts > 0;
+    BOOL wantTop = ts > 0 && [WGD() boolForKey:@"topOn"];
     BOOL onTop = vc.navigationController.topViewController == vc;
     gTopInfo = [NSString stringWithFormat:@"顶栏: style=%ld nb=%@ win=%d onTop=%d", (long)ts, nb ? NSStringFromClass(nb.class) : @"nil", win != nil, onTop];
     if (wantTop && nb && win && onTop && !nb.hidden) {
@@ -1716,9 +1761,11 @@ static void WGApplyTab(UIViewController *tc) {
         [root addGestureRecognizer:e];
         objc_setAssociatedObject(tc, &kEdge, e, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    NSInteger theme = [WGD() integerForKey:@"theme"];
-    if (root.window && (NSInteger)root.window.overrideUserInterfaceStyle != theme)
-        root.window.overrideUserInterfaceStyle = (UIUserInterfaceStyle)theme;
+    static dispatch_once_t themeOnce;   // 主题只在启动时应用一次,之后只在你手动切换时改,避免和其他插件互相抢
+    dispatch_once(&themeOnce, ^{
+        NSInteger theme = [WGD() integerForKey:@"theme"];
+        if (theme != 0 && root.window) root.window.overrideUserInterfaceStyle = (UIUserInterfaceStyle)theme;
+    });
 
     BOOL on = [WGD() boolForKey:@"botOn"];
     NSInteger st = MAX(0, MIN(5, [WGD() integerForKey:@"botStyle"]));
@@ -1730,7 +1777,7 @@ static void WGApplyTab(UIViewController *tc) {
 
     if (!on || !bar) {
         [tv removeFromSuperview]; [plus removeFromSuperview];
-        for (UIView *sv in bar.subviews) sv.alpha = 1;
+        if (gBarTouched && bar) { for (UIView *sv in bar.subviews) sv.alpha = 1; gBarTouched = NO; }
         return;
     }
     BOOL gone = bar.hidden || bar.alpha < 0.01 || !bar.window;
@@ -1767,6 +1814,7 @@ static void WGApplyTab(UIViewController *tc) {
     // 原底栏保留(用于切换/角标逻辑),只是看不见
     bar.backgroundColor = UIColor.clearColor;
     for (UIView *sv in bar.subviews) sv.alpha = 0;
+    gBarTouched = YES;
 
     if (hasPlus) {
         if (!plus) {
