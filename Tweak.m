@@ -1164,7 +1164,7 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"WCGlass";
-    self.tableView.keyboardDismissMode = UITableViewKeyboardDismissModeOnDrag;
+    self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     _secs = @[
         @{@"h": @"样式", @"rows": @[
             @{@"t": @"聊天顶栏样式", @"y": @"nt"},
