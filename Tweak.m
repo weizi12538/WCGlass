@@ -30,8 +30,9 @@ static NSUserDefaults *WGD(void) {
     static dispatch_once_t t;
     dispatch_once(&t, ^{
         d = [[NSUserDefaults alloc] initWithSuiteName:WG_SUITE];
-        [d registerDefaults:@{@"glassTop": @YES, @"glassInput": @YES,
-                              @"tabStyle": @1, @"drawer": @YES, @"theme": @0, @"lang": @0}];
+        [d registerDefaults:@{@"glassInput": @YES, @"drawer": @YES, @"theme": @0, @"lang": @0,
+                              @"topStyle": @2, @"botStyle": @5, @"botOn": @YES, @"chipSel": @0,
+                              @"glassMode": @0, @"tint": @0.38, @"topCover": @NO, @"segLeft": @"", @"segRight": @""}];
     });
     return d;
 }
@@ -48,19 +49,44 @@ static IMP WGHook(Class c, SEL sel, IMP newImp) {
     return old;
 }
 
-static UIVisualEffectView *WGBlur(CGFloat radius, BOOL glass) {
-    UIVisualEffect *eff = nil;
+// 玻璃视图:叠加模式时在内部再放一层液态玻璃
+@interface WGGlassView : UIVisualEffectView
+@property (nonatomic, strong) UIVisualEffectView *inner;
+@end
+@implementation WGGlassView
+- (void)layoutSubviews { [super layoutSubviews]; self.inner.frame = self.contentView.bounds; }
+@end
+
+static UIVisualEffect *WGGlassEffect(void) {
     Class g = NSClassFromString(@"UIGlassEffect"); // iOS 26 液态玻璃
-    if (glass && g) eff = [[g alloc] init];
-    if (!eff) eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial];
-    UIVisualEffectView *v = [[UIVisualEffectView alloc] initWithEffect:eff];
-    v.contentView.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
-        return t.userInterfaceStyle == UIUserInterfaceStyleDark ? [UIColor colorWithWhite:1 alpha:0.06]
-                                                                : [UIColor colorWithWhite:1 alpha:0.38];
-    }];
+    if (!g) return nil;
+    id e = [[g alloc] init];
+    @try { [e setValue:@YES forKey:@"interactive"]; } @catch (__unused NSException *x) {}
+    return (UIVisualEffect *)e;
+}
+
+// 材质由设置面板决定: 0 液态玻璃 / 1 毛玻璃 / 2 叠加(毛玻璃 + 液态玻璃)
+static UIVisualEffectView *WGBlur(CGFloat radius, BOOL unused) {
+    NSInteger mode = [WGD() integerForKey:@"glassMode"];
+    UIVisualEffect *glass = WGGlassEffect();
+    if (!glass) mode = 1;   // 系统不支持液态玻璃,退回毛玻璃
+    UIVisualEffect *eff = mode == 0 ? glass : [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial];
+    WGGlassView *v = [[WGGlassView alloc] initWithEffect:eff];
+    CGFloat tint = [WGD() floatForKey:@"tint"];
+    if (mode != 0) {
+        v.contentView.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
+            return t.userInterfaceStyle == UIUserInterfaceStyleDark ? [UIColor colorWithWhite:1 alpha:tint * 0.16]
+                                                                    : [UIColor colorWithWhite:1 alpha:tint];
+        }];
+        if (radius > 0) { v.layer.borderWidth = 0.6; v.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.5].CGColor; }
+    }
+    if (mode == 2) {
+        v.inner = [[UIVisualEffectView alloc] initWithEffect:glass];
+        v.inner.userInteractionEnabled = NO;
+        [v.contentView addSubview:v.inner];
+    }
     v.layer.cornerRadius = radius;
     v.layer.cornerCurve = kCACornerCurveContinuous;
-    if (radius > 0) { v.layer.borderWidth = 0.6; v.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.5].CGColor; }
     v.clipsToBounds = YES;
     v.userInteractionEnabled = NO;
     return v;
@@ -123,37 +149,56 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
         [(UIControl *)items[i] sendActionsForControlEvents:UIControlEventTouchUpInside];
 }
 
-// ---- 底栏:选中项展开成带文字的胶囊,切换时弹性滑动 ----
+static UIColor *WGDyn(UIColor *l, UIColor *d) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
+        return t.userInterfaceStyle == UIUserInterfaceStyleDark ? d : l;
+    }];
+}
+static UIColor *WGGreen(void) { return [UIColor colorWithRed:7 / 255.0 green:193 / 255.0 blue:96 / 255.0 alpha:1]; }
+static void WGRound(UIView *v) { v.layer.cornerRadius = MIN(v.bounds.size.width, v.bounds.size.height) / 2; }
+
+// ---- 底栏:6 种样式(经典 / 胶囊 / 文字胶囊 / 滑杆 / 双层分组 / 展开胶囊) ----
 @interface WGTabView : UIView
 @property (nonatomic) NSInteger selected;
+@property (nonatomic) NSInteger style;
 @property (nonatomic, copy) void (^onSelect)(NSInteger);
 @property (nonatomic, copy) NSInteger (^indexProvider)(void);
++ (CGFloat)heightForStyle:(NSInteger)s;
 - (void)setSelected:(NSInteger)i animated:(BOOL)a;
 - (void)refreshTitles;
 @end
 
 @implementation WGTabView {
     UIVisualEffectView *_glass;
-    UIView *_pill;
+    UIView *_pill, *_fill, *_knob, *_chipPill;
     NSMutableArray<UIImageView *> *_icons;
-    NSMutableArray<UILabel *> *_labels;
-    NSMutableArray<NSValue *> *_cells;
+    NSMutableArray<UILabel *> *_labels, *_chips;
+    NSMutableArray<NSValue *> *_cells, *_chipCells;
     NSTimer *_timer;
+}
+
++ (CGFloat)heightForStyle:(NSInteger)s {
+    static const CGFloat hs[] = {64, 64, 56, 56, 104, 64};
+    return hs[MAX(0, MIN(5, s))];
 }
 
 - (instancetype)initWithFrame:(CGRect)f {
     if (!(self = [super initWithFrame:f])) return nil;
     _glass = WGBlur(32, NO);
     [self addSubview:_glass];
-    _pill = [UIView new];
-    _pill.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
-        return t.userInterfaceStyle == UIUserInterfaceStyleDark ? [UIColor colorWithWhite:1 alpha:0.16] : [UIColor colorWithWhite:0 alpha:0.09];
-    }];
-    [self addSubview:_pill];
+    _fill = [UIView new]; _knob = [UIView new]; _pill = [UIView new]; _chipPill = [UIView new];
+    for (UIView *v in @[_fill, _knob, _pill, _chipPill]) { v.userInteractionEnabled = NO; [self addSubview:v]; }
+    _fill.backgroundColor = WGDyn([UIColor colorWithWhite:0.13 alpha:1], [UIColor colorWithWhite:0.85 alpha:1]);
+    _knob.backgroundColor = WGDyn(UIColor.whiteColor, [UIColor colorWithWhite:0.3 alpha:1]);
+    _knob.layer.shadowColor = UIColor.blackColor.CGColor;
+    _knob.layer.shadowOpacity = 0.18; _knob.layer.shadowRadius = 4; _knob.layer.shadowOffset = CGSizeMake(0, 2);
+    _chipPill.backgroundColor = UIColor.labelColor;
+
     NSArray *syms = @[@"bubble.fill", @"person.2.fill", @"safari.fill", @"person.fill"];
     NSArray *fallback = @[@"message.fill", @"person.2.fill", @"safari", @"person.fill"];
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightSemibold];
-    _icons = [NSMutableArray array]; _labels = [NSMutableArray array]; _cells = [NSMutableArray array];
+    _icons = [NSMutableArray array]; _labels = [NSMutableArray array]; _chips = [NSMutableArray array];
+    _cells = [NSMutableArray array]; _chipCells = [NSMutableArray array];
     for (int i = 0; i < 4; i++) {
         UIImage *img = [UIImage systemImageNamed:syms[i] withConfiguration:cfg] ?: [UIImage systemImageNamed:fallback[i] withConfiguration:cfg];
         UIImageView *iv = [[UIImageView alloc] initWithImage:img];
@@ -164,54 +209,153 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
         lb.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
         lb.textColor = UIColor.labelColor;
         [self addSubview:lb]; [_labels addObject:lb];
+        UILabel *ch = [UILabel new];
+        ch.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
+        [self addSubview:ch]; [_chips addObject:ch];
     }
     [self refreshTitles];
     [self addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tap:)]];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)];
-    [self addGestureRecognizer:pan];
+    [self addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
     return self;
 }
 
 - (void)refreshTitles {
-    NSArray *t = [WGD() integerForKey:@"lang"] == 1 ? @[@"Chats", @"Contacts", @"Discover", @"Me"] : @[@"微信", @"通讯录", @"发现", @"我"];
-    for (int i = 0; i < 4; i++) _labels[i].text = t[i];
+    BOOL en = [WGD() integerForKey:@"lang"] == 1;
+    NSArray *t = en ? @[@"Chats", @"Contacts", @"Discover", @"Me"] : @[@"微信", @"通讯录", @"发现", @"我"];
+    NSArray *c = en ? @[@"All", @"Unread", @"Groups", @"Work"] : @[@"全部", @"未读", @"群聊", @"工作"];
+    for (int i = 0; i < 4; i++) { _labels[i].text = t[i]; _chips[i].text = c[i]; }
+    [self setNeedsLayout];
+}
+
+- (void)setStyle:(NSInteger)s {
+    if (s == _style) return;
+    _style = s;
     [self setNeedsLayout];
 }
 
 - (void)layoutForSelected:(NSInteger)sel {
     CGFloat W = self.bounds.size.width, H = self.bounds.size.height, pad = 6;
-    CGFloat unit = (W - pad * 2) / (1.8 + 3), x = pad;
+    NSInteger st = _style;
+    UIColor *green = WGGreen(), *sec = UIColor.secondaryLabelColor;
     [_cells removeAllObjects];
+    _pill.hidden = !(st == 1 || st == 2 || st == 5);
+    _fill.hidden = _knob.hidden = (st != 3);
+    _chipPill.hidden = (st != 4);
+    for (UILabel *c in _chips) c.hidden = (st != 4);
+
+    CGFloat cw = (W - pad * 2) / 4;
+    CGFloat dia = H - pad * 2, usable = W - pad * 2 - dia, kcx = pad + dia / 2 + sel * usable / 3;
     for (NSInteger i = 0; i < 4; i++) {
-        CGFloat cw = (i == sel ? 1.8 : 1.0) * unit;
-        CGRect cell = CGRectMake(x, pad, cw, H - pad * 2);
-        [_cells addObject:[NSValue valueWithCGRect:cell]];
-        UIImageView *iv = _icons[i]; UILabel *lb = _labels[i];
-        [lb sizeToFit];
-        CGFloat midY = CGRectGetMidY(cell);
-        if (i == sel) {
-            CGFloat total = 26 + 6 + lb.bounds.size.width;
-            CGFloat sx = cell.origin.x + (cw - total) / 2;
-            iv.center = CGPointMake(sx + 13, midY);
-            lb.frame = CGRectMake(sx + 32, midY - lb.bounds.size.height / 2, lb.bounds.size.width, lb.bounds.size.height);
-            lb.alpha = 1;
-            iv.tintColor = UIColor.labelColor;
-            _pill.frame = cell;
-            _pill.layer.cornerRadius = cell.size.height / 2;
+        CGRect r;
+        if (st == 5) {
+            CGFloat unit = (W - pad * 2) / 4.8, x = pad;
+            for (NSInteger j = 0; j < i; j++) x += (j == sel ? 1.8 : 1.0) * unit;
+            r = CGRectMake(x, pad, (i == sel ? 1.8 : 1.0) * unit, H - pad * 2);
+        } else if (st == 4) {
+            r = CGRectMake(pad + i * cw, 46, cw, H - 46 - 4);
+        } else if (st == 3 || st == 0) {
+            r = CGRectMake(pad + i * cw, 0, cw, H);
         } else {
-            iv.center = CGPointMake(CGRectGetMidX(cell), midY);
-            lb.center = iv.center;
-            lb.alpha = 0;
-            iv.tintColor = UIColor.secondaryLabelColor;
+            r = CGRectMake(pad + i * cw, pad, cw, H - pad * 2);
         }
-        x += cw;
+        [_cells addObject:[NSValue valueWithCGRect:r]];
+        UIImageView *iv = _icons[i]; UILabel *lb = _labels[i];
+        BOOL on = (i == sel);
+        CGFloat mx = CGRectGetMidX(r), my = CGRectGetMidY(r);
+        iv.transform = CGAffineTransformIdentity;
+        iv.alpha = 1;
+        switch (st) {
+            case 0:
+                lb.font = [UIFont systemFontOfSize:10.5 weight:UIFontWeightMedium];
+                [lb sizeToFit];
+                iv.center = CGPointMake(mx, H * 0.36);
+                lb.center = CGPointMake(mx, H * 0.74);
+                lb.alpha = 1; lb.textColor = on ? green : sec; iv.tintColor = on ? green : sec;
+                if (on) iv.transform = CGAffineTransformMakeScale(1.1, 1.1);
+                break;
+            case 1:
+                lb.alpha = 0; iv.center = CGPointMake(mx, my);
+                iv.tintColor = on ? UIColor.labelColor : sec;
+                break;
+            case 2:
+                lb.font = [UIFont systemFontOfSize:15 weight:on ? UIFontWeightSemibold : UIFontWeightMedium];
+                [lb sizeToFit];
+                lb.center = CGPointMake(mx, my); lb.alpha = 1;
+                lb.textColor = on ? UIColor.labelColor : sec;
+                iv.alpha = 0;
+                break;
+            case 3:
+                lb.alpha = 0;
+                iv.center = CGPointMake(kcx, H / 2);
+                iv.alpha = on ? 1 : 0;
+                iv.tintColor = UIColor.labelColor;
+                break;
+            case 4:
+                lb.alpha = 0; iv.center = CGPointMake(mx, my);
+                iv.tintColor = on ? green : sec;
+                break;
+            default: {   // 5 展开胶囊
+                lb.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+                [lb sizeToFit];
+                if (on) {
+                    CGFloat total = 26 + 6 + lb.bounds.size.width;
+                    CGFloat sx = r.origin.x + (r.size.width - total) / 2;
+                    iv.center = CGPointMake(sx + 13, my);
+                    lb.frame = CGRectMake(sx + 32, my - lb.bounds.size.height / 2, lb.bounds.size.width, lb.bounds.size.height);
+                    lb.alpha = 1;
+                    lb.textColor = UIColor.systemBackgroundColor;
+                    iv.tintColor = UIColor.systemBackgroundColor;
+                } else {
+                    iv.center = CGPointMake(mx, my);
+                    lb.center = iv.center; lb.alpha = 0;
+                    iv.tintColor = sec;
+                }
+            }
+        }
+    }
+
+    if (st == 1 || st == 2 || st == 5) {
+        CGRect r = _cells[sel].CGRectValue;
+        CGRect pr = r;
+        if (st == 1) pr = CGRectMake(CGRectGetMidX(r) - r.size.height / 2, r.origin.y, r.size.height, r.size.height);
+        else if (st == 2) pr = CGRectInset(r, 4, 0);
+        _pill.frame = pr;
+        _pill.layer.cornerRadius = pr.size.height / 2;
+        _pill.backgroundColor = st == 5 ? UIColor.labelColor
+                                        : WGDyn([UIColor colorWithWhite:1 alpha:0.92], [UIColor colorWithWhite:1 alpha:0.22]);
+    }
+    if (st == 3) {
+        _knob.frame = CGRectMake(kcx - dia / 2, pad, dia, dia);
+        _knob.layer.cornerRadius = dia / 2;
+        _fill.frame = CGRectMake(pad, pad, kcx - pad + dia * 0.1, dia);
+        _fill.layer.cornerRadius = dia / 2;
+    }
+    if (st == 4) {
+        [_chipCells removeAllObjects];
+        NSInteger cs = MAX(0, MIN(3, [WGD() integerForKey:@"chipSel"]));
+        NSMutableArray *ws = [NSMutableArray array];
+        CGFloat total = 0, gap = 8;
+        for (UILabel *c in _chips) { [c sizeToFit]; CGFloat w = c.bounds.size.width + 22; [ws addObject:@(w)]; total += w; }
+        total += gap * 3;
+        CGFloat x = (W - total) / 2;
+        for (NSInteger i = 0; i < 4; i++) {
+            CGFloat w = [ws[i] doubleValue];
+            CGRect cr = CGRectMake(x, 12, w, 26);
+            [_chipCells addObject:[NSValue valueWithCGRect:cr]];
+            _chips[i].frame = cr;
+            _chips[i].textAlignment = NSTextAlignmentCenter;
+            _chips[i].textColor = i == cs ? UIColor.systemBackgroundColor : UIColor.secondaryLabelColor;
+            x += w + gap;
+        }
+        _chipPill.frame = _chipCells[cs].CGRectValue;
+        _chipPill.layer.cornerRadius = 13;
     }
 }
 
 - (void)layoutSubviews {
     [super layoutSubviews];
     _glass.frame = self.bounds;
-    _glass.layer.cornerRadius = self.bounds.size.height / 2;
+    _glass.layer.cornerRadius = _style == 4 ? 30 : self.bounds.size.height / 2;
     [self layoutForSelected:_selected];
 }
 
@@ -235,14 +379,38 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
     return -1;
 }
 
+- (NSInteger)chipAtX:(CGFloat)x {
+    for (NSInteger i = 0; i < (NSInteger)_chipCells.count; i++) {
+        CGRect r = _chipCells[i].CGRectValue;
+        if (x >= CGRectGetMinX(r) - 4 && x < CGRectGetMaxX(r) + 4) return i;
+    }
+    return -1;
+}
+
 - (void)pick:(NSInteger)i {
     if (i < 0 || i == _selected) return;
     [self setSelected:i animated:YES];
     if (self.onSelect) self.onSelect(i);
 }
-- (void)tap:(UITapGestureRecognizer *)g { [self pick:[self indexAtX:[g locationInView:self].x]]; }
+
+- (void)tap:(UITapGestureRecognizer *)g {
+    CGPoint p = [g locationInView:self];
+    if (_style == 4 && p.y < 46) {
+        NSInteger c = [self chipAtX:p.x];
+        if (c >= 0) {
+            [WGD() setInteger:c forKey:@"chipSel"];
+            [UIView animateWithDuration:0.3 animations:^{ [self layoutForSelected:self->_selected]; }];
+        }
+        return;
+    }
+    [self pick:[self indexAtX:p.x]];
+}
+
 - (void)pan:(UIPanGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateChanged) [self pick:[self indexAtX:[g locationInView:self].x]];
+    if (g.state != UIGestureRecognizerStateChanged) return;
+    CGPoint p = [g locationInView:self];
+    if (_style == 4 && p.y < 46) return;
+    [self pick:[self indexAtX:p.x]];
 }
 
 - (void)didMoveToWindow {
@@ -259,21 +427,27 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
 }
 @end
 
-// ---- 聊天顶栏:左「返回」胶囊 + 中间分段胶囊 + 右侧圆形菜单 ----
+// ---- 聊天顶栏:7 种样式(标题胶囊 / Pins 胶囊 / 仿TIM / 名签胶囊 / 名签竖线 / 头像居中 / 昵称横线) ----
 @interface WGTopBar : UIView
+@property (nonatomic) NSInteger style;
 @property (nonatomic, copy) void (^onBack)(void);
 @property (nonatomic, copy) void (^onInfo)(void);
+@property (nonatomic, copy) void (^onMenu)(void);
 @property (nonatomic, copy) NSString *title;
+@property (nonatomic, copy) NSString *customLeft;
+@property (nonatomic, copy) NSString *customRight;
+@property (nonatomic, copy) NSString *backText;
 @property (nonatomic, strong) UIColor *coverColor;
+@property (nonatomic, strong) UIImage *avatar;
+- (void)refreshTexts;
 @end
 
 @implementation WGTopBar {
-    UIView *_cover;
-    UIVisualEffectView *_l, *_c, *_r;
-    UIImageView *_chev, *_menu;
-    UILabel *_back, *_t1, *_t2;
-    UIView *_seg;
-    UIButton *_bl, *_b1, *_b2, *_br;
+    UIView *_cover, *_seg, *_vbar, *_av;
+    UIVisualEffectView *_g1, *_g2, *_g3, *_g4;
+    UIImageView *_chev, *_ic1, *_ic2, *_dd, *_avImg;
+    UILabel *_back, *_t1, *_t2, *_avL;
+    UIButton *_bBack, *_bTitle, *_bSeg2, *_bR1, *_bR2, *_bAv;
     NSInteger _idx;
 }
 
@@ -284,60 +458,71 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
     return b;
 }
 
+- (UIImageView *)iconView {
+    UIImageView *v = [UIImageView new];
+    v.tintColor = UIColor.labelColor;
+    v.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:v];
+    return v;
+}
+
+- (UILabel *)label {
+    UILabel *l = [UILabel new];
+    l.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self addSubview:l];
+    return l;
+}
+
 - (instancetype)initWithFrame:(CGRect)f {
     if (!(self = [super initWithFrame:f])) return nil;
+    self.clipsToBounds = NO;
     _cover = [UIView new];
     [self addSubview:_cover];
-    _l = WGBlur(21.5, NO); _c = WGBlur(21.5, NO); _r = WGBlur(21.5, NO);
-    [self addSubview:_l]; [self addSubview:_c]; [self addSubview:_r];
-
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightBold];
-    _chev = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.left" withConfiguration:cfg]];
-    _chev.tintColor = UIColor.labelColor;
-    _chev.contentMode = UIViewContentModeScaleAspectFit;
-    [_l.contentView addSubview:_chev];
-    _back = [UILabel new];
-    _back.text = WGL(@"返回", @"Back");
-    _back.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
-    _back.textColor = UIColor.labelColor;
-    [_l.contentView addSubview:_back];
-
+    _g1 = WGBlur(21.5, NO); _g2 = WGBlur(21.5, NO); _g3 = WGBlur(21.5, NO); _g4 = WGBlur(21.5, NO);
+    for (UIView *g in @[_g1, _g2, _g3, _g4]) [self addSubview:g];
     _seg = [UIView new];
-    _seg.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *t) {
-        return t.userInterfaceStyle == UIUserInterfaceStyleDark ? [UIColor colorWithWhite:1 alpha:0.14] : [UIColor colorWithWhite:1 alpha:0.55];
-    }];
-    [_c.contentView addSubview:_seg];
-    _t1 = [UILabel new]; _t2 = [UILabel new];
-    for (UILabel *t in @[_t1, _t2]) {
-        t.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
-        t.textAlignment = NSTextAlignmentCenter;
-        t.lineBreakMode = NSLineBreakByTruncatingTail;
-        [_c.contentView addSubview:t];
-    }
-    _t1.text = WGL(@"聊天", @"Chat");
-    _t2.text = WGL(@"详情", @"Info");
-
-    _menu = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"line.3.horizontal" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:20 weight:UIImageSymbolWeightSemibold]]];
-    _menu.tintColor = UIColor.labelColor;
-    _menu.contentMode = UIViewContentModeScaleAspectFit;
-    [_r.contentView addSubview:_menu];
-
-    _bl = [self btn:@selector(tapBack)];
-    _b1 = [self btn:@selector(tapChat)];
-    _b2 = [self btn:@selector(tapInfo)];
-    _br = [self btn:@selector(tapInfo)];
-    [self updateSeg];
+    _seg.backgroundColor = WGDyn([UIColor colorWithWhite:1 alpha:0.6], [UIColor colorWithWhite:1 alpha:0.16]);
+    [self addSubview:_seg];
+    _vbar = [UIView new];
+    _vbar.backgroundColor = UIColor.labelColor;
+    [self addSubview:_vbar];
+    _av = [UIView new];
+    _av.backgroundColor = [UIColor colorWithRed:0.93 green:0.56 blue:0.43 alpha:1];
+    _av.clipsToBounds = YES;
+    _avImg = [UIImageView new]; _avImg.contentMode = UIViewContentModeScaleAspectFill; [_av addSubview:_avImg];
+    _avL = [UILabel new]; _avL.textColor = UIColor.whiteColor; _avL.textAlignment = NSTextAlignmentCenter;
+    _avL.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
+    [_av addSubview:_avL];
+    [self addSubview:_av];
+    _chev = [self iconView]; _ic1 = [self iconView]; _ic2 = [self iconView]; _dd = [self iconView];
+    _dd.tintColor = UIColor.secondaryLabelColor;
+    _back = [self label]; _t1 = [self label]; _t2 = [self label];
+    _back.textColor = UIColor.labelColor;
+    _bBack = [self btn:@selector(tapBack)];
+    _bTitle = [self btn:@selector(tapInfo)];
+    _bSeg2 = [self btn:@selector(tapSeg2)];
+    _bR1 = [self btn:@selector(tapMenu)];
+    _bR2 = [self btn:@selector(tapBack)];
+    _bAv = [self btn:@selector(tapMenu)];
     return self;
 }
 
-- (void)setTitle:(NSString *)title {
-    _title = [title copy];
-    _t1.text = title.length ? title : WGL(@"聊天", @"Chat");
+- (void)setStyle:(NSInteger)s {
+    _style = s;
+    [self refreshTexts];
+    [self setNeedsLayout];
 }
+- (void)setTitle:(NSString *)t { _title = [t copy]; [self refreshTexts]; }
+- (void)setCoverColor:(UIColor *)c { _coverColor = c; _cover.backgroundColor = c; }
+- (void)setAvatar:(UIImage *)a { _avatar = a; _avImg.image = a; _avL.hidden = a != nil; }
 
-- (void)setCoverColor:(UIColor *)c {
-    _coverColor = c;
-    _cover.backgroundColor = c;
+- (void)refreshTexts {
+    NSString *main = self.customLeft.length ? self.customLeft : (self.title.length ? self.title : WGL(@"聊天", @"Chat"));
+    _t1.text = main;
+    _t2.text = _style == 2 ? (self.customRight.length ? self.customRight : WGL(@"详情", @"Info")) : (self.customRight ?: @"");
+    _back.text = _style == 3 ? (self.backText ?: @"") : WGL(@"返回", @"Back");
+    _avL.text = main.length ? [main substringWithRange:[main rangeOfComposedCharacterSequenceAtIndex:0]] : @"";
+    _avL.hidden = _avatar != nil;
 }
 
 - (void)updateSeg {
@@ -347,41 +532,174 @@ static void WGSelectIndex(UIViewController *tc, NSInteger i, NSArray<UIView *> *
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    CGFloat W = self.bounds.size.width, H = self.bounds.size.height, h = 43, y = (H - h) / 2, m = 16, cw = 157;
     _cover.frame = self.bounds;
-    _l.frame = CGRectMake(m, y, 78, h);
-    _c.frame = CGRectMake((W - cw) / 2, y, cw, h);
-    _r.frame = CGRectMake(W - m - h, y, h, h);
-    for (UIView *v in @[_l, _c, _r]) v.layer.cornerRadius = h / 2;
-    _chev.frame = CGRectMake(13, (h - 20) / 2, 14, 20);
-    _back.frame = CGRectMake(33, 0, 42, h);
-    CGFloat sw = (cw - 8) / 2;
-    _seg.frame = CGRectMake(4 + _idx * sw, 4, sw, h - 8);
-    _seg.layer.cornerRadius = (h - 8) / 2;
-    _t1.frame = CGRectMake(8, 0, sw - 8, h);
-    _t2.frame = CGRectMake(4 + sw, 0, sw, h);
-    _menu.frame = CGRectMake((h - 22) / 2, (h - 22) / 2, 22, 22);
-    _bl.frame = _l.frame;
-    _b1.frame = CGRectMake(_c.frame.origin.x + 4, y, sw, h);
-    _b2.frame = CGRectMake(_c.frame.origin.x + 4 + sw, y, sw, h);
-    _br.frame = _r.frame;
+    NSArray *all = @[_g1, _g2, _g3, _g4, _seg, _vbar, _av, _chev, _ic1, _ic2, _dd, _back, _t1, _t2, _bBack, _bTitle, _bSeg2, _bR1, _bR2, _bAv];
+    for (UIView *v in all) v.hidden = YES;
+    CGFloat W = self.bounds.size.width, H = self.bounds.size.height, h = 43, y = (H - h) / 2, m = 16, mid = H / 2;
+    void (^P)(UIView *, CGRect) = ^(UIView *v, CGRect f) { v.hidden = NO; v.frame = f; };
+    UIImageSymbolConfiguration *c17 = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightBold];
+    UIImageSymbolConfiguration *c20 = [UIImageSymbolConfiguration configurationWithPointSize:20 weight:UIImageSymbolWeightSemibold];
+    UIImageSymbolConfiguration *c15 = [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightSemibold];
+    UIImageSymbolConfiguration *c9 = [UIImageSymbolConfiguration configurationWithPointSize:9 weight:UIImageSymbolWeightBold];
+    _chev.image = [UIImage systemImageNamed:@"chevron.left" withConfiguration:c17];
+    _dd.image = [UIImage systemImageNamed:@"chevron.down" withConfiguration:c9];
+    _t1.textColor = UIColor.labelColor;
+    _t2.textColor = UIColor.secondaryLabelColor;
+    _t2.font = [UIFont systemFontOfSize:11];
+    _t1.textAlignment = NSTextAlignmentCenter;
+    _t2.textAlignment = NSTextAlignmentCenter;
+    BOOL hasSub = _style != 2 && _t2.text.length > 0;
+
+    switch (_style) {
+        case 1: {   // 标题胶囊
+            P(_g1, CGRectMake(m, y, h, h));
+            P(_chev, CGRectMake(m + (h - 14) / 2 - 1, mid - 10, 14, 20));
+            P(_bBack, _g1.frame);
+            _t1.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+            [_t1 sizeToFit];
+            CGFloat tw = MIN(150, _t1.bounds.size.width);
+            CGFloat cw = MAX(110, tw + 46), ch = hasSub ? 50 : h;
+            P(_g2, CGRectMake((W - cw) / 2, (H - ch) / 2, cw, ch));
+            P(_t1, CGRectMake(_g2.frame.origin.x + 8, _g2.frame.origin.y + (hasSub ? 7 : (ch - 20) / 2), cw - 28, 20));
+            P(_dd, CGRectMake(CGRectGetMaxX(_g2.frame) - 22, CGRectGetMidY(_t1.frame) - 5, 10, 10));
+            if (hasSub) P(_t2, CGRectMake(_g2.frame.origin.x + 8, _g2.frame.origin.y + 28, cw - 16, 14));
+            P(_av, CGRectMake(W - m - h, y, h, h));
+            P(_bAv, _av.frame);
+            P(_bTitle, _g2.frame);
+        } break;
+        case 2: {   // Pins 胶囊
+            P(_g1, CGRectMake(m, y, 78, h));
+            P(_chev, CGRectMake(m + 13, mid - 10, 14, 20));
+            _back.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
+            P(_back, CGRectMake(m + 33, y, 42, h));
+            P(_bBack, _g1.frame);
+            CGFloat cw = 157, sw = (cw - 8) / 2, cx = (W - cw) / 2;
+            P(_g2, CGRectMake(cx, y, cw, h));
+            P(_seg, CGRectMake(cx + 4 + _idx * sw, y + 4, sw, h - 8));
+            _seg.layer.cornerRadius = (h - 8) / 2;
+            _t1.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
+            _t2.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
+            P(_t1, CGRectMake(cx + 8, y, sw - 8, h));
+            P(_t2, CGRectMake(cx + 4 + sw, y, sw - 12, h));
+            P(_dd, CGRectMake(cx + cw - 17, mid - 5, 10, 10));
+            P(_g3, CGRectMake(W - m - h, y, h, h));
+            _ic1.image = [UIImage systemImageNamed:@"line.3.horizontal" withConfiguration:c20];
+            P(_ic1, CGRectMake(W - m - h + (h - 22) / 2, y + (h - 22) / 2, 22, 22));
+            P(_bR1, _g3.frame);
+            P(_bTitle, CGRectMake(cx + 4, y, sw, h));
+            P(_bSeg2, CGRectMake(cx + 4 + sw, y, sw, h));
+            [self updateSeg];
+        } break;
+        case 3: {   // 仿 TIM
+            _back.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
+            [_back sizeToFit];
+            CGFloat bw = _back.text.length ? 32 + _back.bounds.size.width + 12 : 46;
+            P(_g1, CGRectMake(m, y, bw, h));
+            P(_chev, CGRectMake(m + 13, mid - 10, 14, 20));
+            if (_back.text.length) P(_back, CGRectMake(m + 32, y, bw - 40, h));
+            P(_bBack, _g1.frame);
+            _t1.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+            [_t1 sizeToFit];
+            CGFloat tw = MIN(150, _t1.bounds.size.width);
+            CGFloat cw = MAX(100, tw + 36), ch = hasSub ? 50 : h;
+            P(_g2, CGRectMake((W - cw) / 2, (H - ch) / 2, cw, ch));
+            P(_t1, CGRectMake(_g2.frame.origin.x + 8, _g2.frame.origin.y + (hasSub ? 7 : (ch - 20) / 2), cw - 16, 20));
+            if (hasSub) P(_t2, CGRectMake(_g2.frame.origin.x + 8, _g2.frame.origin.y + 28, cw - 16, 14));
+            P(_g3, CGRectMake(W - m - h, y, h, h));
+            _ic1.image = [UIImage systemImageNamed:@"ellipsis" withConfiguration:c20];
+            P(_ic1, CGRectMake(W - m - h + (h - 22) / 2, y + (h - 22) / 2, 22, 22));
+            P(_bR1, _g3.frame);
+            P(_bTitle, _g2.frame);
+        } break;
+        case 4: {   // 名签胶囊
+            _t1.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+            [_t1 sizeToFit];
+            CGFloat tw = MIN(W * 0.45, _t1.bounds.size.width), gw = tw + 34;
+            P(_g1, CGRectMake(m, y, gw, h));
+            P(_t1, CGRectMake(m + 17, y, gw - 34, h));
+            P(_bTitle, _g1.frame);
+            P(_g4, CGRectMake(W - m - h, y, h, h));
+            _ic2.image = [UIImage systemImageNamed:@"xmark" withConfiguration:c15];
+            P(_ic2, CGRectMake(W - m - h + (h - 18) / 2, y + (h - 18) / 2, 18, 18));
+            P(_bR2, _g4.frame);
+            P(_g3, CGRectMake(W - m - h * 2 - 8, y, h, h));
+            _ic1.image = [UIImage systemImageNamed:@"ellipsis" withConfiguration:c20];
+            P(_ic1, CGRectMake(CGRectGetMinX(_g3.frame) + (h - 22) / 2, y + (h - 22) / 2, 22, 22));
+            P(_bR1, _g3.frame);
+        } break;
+        case 5: {   // 名签竖线
+            P(_vbar, CGRectMake(m, y + 3, 3, h - 6));
+            _t1.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
+            _t1.textAlignment = NSTextAlignmentLeft;
+            P(_t1, CGRectMake(m + 12, y + (hasSub ? 1 : (h - 22) / 2), W * 0.5, 22));
+            if (hasSub) {
+                _t2.font = [UIFont systemFontOfSize:12];
+                _t2.textAlignment = NSTextAlignmentLeft;
+                P(_t2, CGRectMake(m + 12, y + 23, W * 0.5, 16));
+            }
+            _ic2.image = [UIImage systemImageNamed:@"xmark" withConfiguration:c17];
+            P(_ic2, CGRectMake(W - m - 24, mid - 10, 20, 20));
+            P(_bR2, CGRectMake(W - m - 44, y, 44, h));
+            _ic1.image = [UIImage systemImageNamed:@"ellipsis" withConfiguration:c20];
+            P(_ic1, CGRectMake(W - m - 68, mid - 11, 22, 22));
+            P(_bR1, CGRectMake(W - m - 88, y, 44, h));
+            P(_bTitle, CGRectMake(m, y, W * 0.55, h));
+        } break;
+        case 6: {   // 头像居中
+            P(_chev, CGRectMake(m, mid - 12, 16, 24));
+            P(_bBack, CGRectMake(m - 8, y, 48, h));
+            P(_av, CGRectMake(W / 2 - 28, mid - 30, 56, 56));
+            P(_bAv, _av.frame);
+            _t1.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
+            P(_t1, CGRectMake(W / 2 - 70, CGRectGetMaxY(_av.frame) + 2, 140, 14));
+            _ic1.image = [UIImage systemImageNamed:@"ellipsis" withConfiguration:c20];
+            P(_ic1, CGRectMake(W - m - 24, mid - 11, 22, 22));
+            P(_bR1, CGRectMake(W - m - 44, y, 44, h));
+        } break;
+        case 7: {   // 昵称横线
+            P(_chev, CGRectMake(m, mid - 12, 16, 24));
+            P(_bBack, CGRectMake(m - 8, y, 48, h));
+            _t1.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
+            _t1.textAlignment = NSTextAlignmentLeft;
+            P(_t1, CGRectMake(m + 28, y, W - m - 28 - 100, h));
+            P(_bTitle, _t1.frame);
+            P(_g3, CGRectMake(W - m - 76, y, 76, h));
+            _ic1.image = [UIImage systemImageNamed:@"line.3.horizontal" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:24 weight:UIImageSymbolWeightSemibold]];
+            P(_ic1, CGRectMake(W - m - 76 + 25, y + (h - 26) / 2, 26, 26));
+            P(_bR1, _g3.frame);
+        } break;
+        default: break;
+    }
+    for (UIView *g in @[_g1, _g2, _g3, _g4]) if (!g.hidden) WGRound(g);
+    if (!_av.hidden) {
+        _av.layer.cornerRadius = _av.bounds.size.width / 2;
+        _avImg.frame = _av.bounds;
+        _avL.frame = _av.bounds;
+    }
 }
 
 - (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e {
-    return CGRectContainsPoint(_l.frame, p) || CGRectContainsPoint(_c.frame, p) || CGRectContainsPoint(_r.frame, p);
+    for (UIButton *b in @[_bBack, _bTitle, _bSeg2, _bR1, _bR2, _bAv])
+        if (!b.hidden && CGRectContainsPoint(b.frame, p)) return YES;
+    return NO;
 }
 
 - (void)moveSeg:(NSInteger)i {
     _idx = i;
     [UIView animateWithDuration:0.45 delay:0 usingSpringWithDamping:0.8 initialSpringVelocity:0.3 options:0 animations:^{
-        CGFloat sw = (157 - 8) / 2;
-        self->_seg.frame = CGRectMake(4 + i * sw, 4, sw, 35);
+        CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+        CGFloat sw = (157 - 8) / 2, cx = (W - 157) / 2, y = (H - 43) / 2;
+        self->_seg.frame = CGRectMake(cx + 4 + i * sw, y + 4, sw, 35);
         [self updateSeg];
     } completion:nil];
 }
 - (void)tapBack { if (self.onBack) self.onBack(); }
-- (void)tapChat { [self moveSeg:0]; }
+- (void)tapMenu { if (self.onMenu) self.onMenu(); }
 - (void)tapInfo {
+    if (_style == 2) { [self moveSeg:0]; return; }
+    if (self.onInfo) self.onInfo();
+}
+- (void)tapSeg2 {
     [self moveSeg:1];
     if (self.onInfo) self.onInfo();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self moveSeg:0]; });
@@ -499,62 +817,464 @@ static void WGShowDiag(void) {
 
 #pragma mark - 插件面板
 
-@interface WGPanelVC : UITableViewController
-@end
-
-@implementation WGPanelVC
-- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
-- (void)viewDidLoad { [super viewDidLoad]; self.title = @"WCGlass"; }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return 2; }
-- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return s == 0 ? 4 : 3; }
-- (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s { return s == 0 ? @"外观" : @"工具"; }
-- (NSString *)tableView:(UITableView *)t titleForFooterInSection:(NSInteger)s {
-    return s == 0 ? @"部分开关关闭后需重新进入聊天页或重启微信生效" : nil;
+static void WGRefreshAll(void) {
+    UIView *root = gTab.view;
+    [[root viewWithTag:TAG_GLASS_TAB] removeFromSuperview];
+    [[root viewWithTag:TAG_TAB_PLUS] removeFromSuperview];
+    [gTopBar removeFromSuperview];
+    gTopBar = nil;
+    [root setNeedsLayout];
+    [root layoutIfNeeded];
 }
 
-- (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
-    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-    if (ip.section == 0) {
-        NSArray *titles = @[@"聊天顶栏毛玻璃", @"聊天输入框毛玻璃", @"首页底栏样式", @"首页侧滑侧边栏"];
-        c.textLabel.text = titles[ip.row];
-        c.selectionStyle = UITableViewCellSelectionStyleNone;
-        if (ip.row == 2) {
-            UISegmentedControl *sc = [[UISegmentedControl alloc] initWithItems:@[@"原版", @"样式一", @"样式二"]];
-            sc.frame = CGRectMake(0, 0, 190, 30);
-            sc.selectedSegmentIndex = [WGD() integerForKey:@"tabStyle"];
-            [sc addTarget:self action:@selector(segChanged:) forControlEvents:UIControlEventValueChanged];
-            c.accessoryView = sc;
-        } else {
-            NSString *key = ip.row == 0 ? @"glassTop" : (ip.row == 1 ? @"glassInput" : @"drawer");
-            UISwitch *sw = [UISwitch new];
-            sw.on = [WGD() boolForKey:key];
-            sw.accessibilityIdentifier = key;
-            [sw addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
-            c.accessoryView = sw;
+static NSArray<NSString *> *WGTopNames(void) {
+    return @[@"原生", @"标题胶囊", @"Pins 胶囊", @"仿TIM", @"名签胶囊", @"名签竖线", @"头像居中", @"昵称横线"];
+}
+static NSArray<NSString *> *WGBotNames(void) {
+    return @[@"经典", @"胶囊", @"文字胶囊", @"滑杆", @"双层分组", @"展开胶囊"];
+}
+
+#pragma mark - 样式预览卡片
+
+static UIView *WGBox(UIView *p, CGRect r, UIColor *c, CGFloat rad, CGFloat s) {
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(r.origin.x * s, r.origin.y * s, r.size.width * s, r.size.height * s)];
+    v.backgroundColor = c;
+    v.layer.cornerRadius = rad * s;
+    v.layer.cornerCurve = kCACornerCurveContinuous;
+    [p addSubview:v];
+    return v;
+}
+static UILabel *WGTxt(UIView *p, NSString *t, CGRect r, CGFloat fs, UIFontWeight w, UIColor *c, NSTextAlignment al, CGFloat s) {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(r.origin.x * s, r.origin.y * s, r.size.width * s, r.size.height * s)];
+    l.text = t; l.font = [UIFont systemFontOfSize:fs * s weight:w]; l.textColor = c; l.textAlignment = al;
+    l.adjustsFontSizeToFitWidth = YES; l.minimumScaleFactor = 0.6;
+    [p addSubview:l];
+    return l;
+}
+static UIImageView *WGSym(UIView *p, NSString *n, CGRect r, CGFloat pt, UIColor *c, CGFloat s) {
+    UIImage *img = [UIImage systemImageNamed:n withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:pt * s weight:UIImageSymbolWeightSemibold]];
+    UIImageView *v = [[UIImageView alloc] initWithImage:img];
+    v.frame = CGRectMake(r.origin.x * s, r.origin.y * s, r.size.width * s, r.size.height * s);
+    v.contentMode = UIViewContentModeScaleAspectFit;
+    v.tintColor = c;
+    [p addSubview:v];
+    return v;
+}
+
+#define PB(x, y, w, h, col, r) WGBox(v, CGRectMake(x, y, w, h), col, r, s)
+#define PT(t, x, y, w, h, fs, wt, col, al) WGTxt(v, t, CGRectMake(x, y, w, h), fs, wt, col, al, s)
+#define PS(n, x, y, w, h, pt, col) WGSym(v, n, CGRectMake(x, y, w, h), pt, col, s)
+
+// kind 0 = 顶栏预览, 1 = 底栏预览;坐标按 200x118 的画布书写
+static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
+    CGFloat s = sz.width / 200.0;
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, sz.width, sz.height)];
+    v.backgroundColor = WGDyn([UIColor colorWithWhite:0.93 alpha:1], [UIColor colorWithWhite:0.17 alpha:1]);
+    v.layer.cornerRadius = 22;
+    v.layer.cornerCurve = kCACornerCurveContinuous;
+    v.clipsToBounds = YES;
+    UIColor *W1 = WGDyn(UIColor.whiteColor, [UIColor colorWithWhite:0.3 alpha:1]);
+    UIColor *W5 = WGDyn([UIColor colorWithWhite:1 alpha:0.5], [UIColor colorWithWhite:0.3 alpha:0.5]);
+    UIColor *L = UIColor.labelColor, *S = UIColor.secondaryLabelColor, *G = WGGreen();
+    UIColor *orange = [UIColor colorWithRed:0.93 green:0.58 blue:0.45 alpha:1];
+    UIColor *blue = [UIColor colorWithRed:0.35 green:0.55 blue:0.9 alpha:1];
+    UIColor *lgreen = [UIColor colorWithRed:0.66 green:0.9 blue:0.45 alpha:1];
+    UIColor *purple = [UIColor colorWithRed:0.6 green:0.45 blue:0.9 alpha:1];
+    UIColor *grn2 = [UIColor colorWithRed:0.45 green:0.75 blue:0.5 alpha:1];
+    UIColor *bar = WGDyn([UIColor colorWithWhite:0.86 alpha:1], [UIColor colorWithWhite:0.3 alpha:1]);
+
+    if (kind == 0) {
+        PB(8, 52, 18, 18, orange, 4);
+        PB(30, 49, 58, 24, W1, 6);
+        PT(@"今天下雨了", 30, 49, 58, 24, 9.5, UIFontWeightRegular, L, NSTextAlignmentCenter);
+        PB(112, 86, 50, 24, lgreen, 6);
+        PT(@"带伞了", 112, 86, 50, 24, 9.5, UIFontWeightRegular, L, NSTextAlignmentCenter);
+        PB(168, 86, 18, 18, blue, 4);
+        switch (st) {
+            case 0:
+                PB(0, 0, 200, 40, W5, 0);
+                PS(@"chevron.left", 8, 14, 10, 12, 9, L);
+                PT(@"李四", 70, 12, 60, 16, 10, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PT(@"···", 164, 10, 28, 16, 12, UIFontWeightBold, L, NSTextAlignmentCenter);
+                break;
+            case 1:
+                PB(8, 9, 24, 24, W1, 12);
+                PS(@"chevron.left", 14, 14, 12, 14, 9, L);
+                PB(66, 5, 70, 32, W1, 16);
+                PT(@"Chat", 70, 8, 50, 14, 10, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PS(@"chevron.down", 120, 11, 8, 8, 6, S);
+                PT(@"在忙，晚点回", 66, 22, 70, 10, 6.5, UIFontWeightRegular, S, NSTextAlignmentCenter);
+                PB(166, 8, 26, 26, orange, 13);
+                break;
+            case 2:
+                PB(8, 11, 50, 22, W1, 11);
+                PS(@"chevron.left", 13, 15, 8, 13, 8, L);
+                PT(@"Back", 24, 11, 32, 22, 9.5, UIFontWeightBold, L, NSTextAlignmentLeft);
+                PB(62, 11, 88, 22, W5, 11);
+                PB(65, 13, 38, 18, W1, 9);
+                PT(@"Chat", 65, 13, 38, 18, 9.5, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PT(@"Pins", 106, 11, 30, 22, 9.5, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PS(@"chevron.down", 135, 19, 8, 6, 6, L);
+                PB(166, 11, 24, 22, W1, 11);
+                PS(@"line.3.horizontal", 171, 15, 14, 14, 9, L);
+                break;
+            case 3:
+                PB(8, 9, 46, 26, W1, 13);
+                PS(@"chevron.left", 14, 14, 8, 14, 8, L);
+                PT(@"12", 25, 9, 26, 26, 10, UIFontWeightBold, L, NSTextAlignmentLeft);
+                PB(74, 5, 54, 34, W1, 16);
+                PT(@"Chat", 74, 9, 54, 14, 10, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PT(@"在线", 74, 23, 54, 10, 6.5, UIFontWeightRegular, S, NSTextAlignmentCenter);
+                PB(162, 10, 28, 24, W1, 12);
+                PT(@"···", 162, 10, 28, 24, 11, UIFontWeightBold, L, NSTextAlignmentCenter);
+                break;
+            case 4:
+                PB(8, 9, 40, 26, W1, 13);
+                PT(@"李四", 8, 9, 40, 26, 9.5, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PB(142, 9, 24, 24, W1, 12);
+                PT(@"···", 142, 9, 24, 24, 11, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PB(170, 9, 24, 24, W1, 12);
+                PS(@"xmark", 176, 15, 12, 12, 8, L);
+                break;
+            case 5:
+                PB(9, 9, 2, 24, L, 1);
+                PT(@"李四", 16, 8, 50, 14, 10, UIFontWeightBold, L, NSTextAlignmentLeft);
+                PT(@"在线", 16, 22, 50, 10, 7, UIFontWeightRegular, S, NSTextAlignmentLeft);
+                PT(@"···", 146, 10, 28, 16, 12, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PS(@"xmark", 178, 13, 10, 10, 8, L);
+                break;
+            case 6:
+                PS(@"chevron.left", 10, 14, 8, 14, 9, L);
+                PB(84, 3, 32, 32, orange, 16);
+                PT(@"李四", 70, 37, 60, 10, 7, UIFontWeightBold, L, NSTextAlignmentCenter);
+                PT(@"···", 164, 12, 28, 16, 12, UIFontWeightBold, L, NSTextAlignmentCenter);
+                break;
+            default:
+                PS(@"chevron.left", 10, 14, 8, 14, 9, L);
+                PT(@"家人群 (6)", 24, 12, 70, 16, 9.5, UIFontWeightBold, L, NSTextAlignmentLeft);
+                PS(@"speaker.slash", 90, 15, 10, 10, 7, S);
+                PB(160, 8, 34, 26, W1, 13);
+                PS(@"line.3.horizontal", 167, 13, 20, 16, 11, L);
+                break;
         }
     } else {
-        NSArray *t2 = @[@"立即诊断(复制到剪贴板)", @"8秒后诊断(切到聊天页用)", @"恢复默认设置"];
-        c.textLabel.text = t2[ip.row];
-        c.textLabel.textColor = ip.row == 2 ? UIColor.systemRedColor : UIColor.labelColor;
+        PB(10, 10, 24, 24, orange, 7);  PB(42, 14, 62, 5, bar, 2.5);  PB(42, 24, 96, 5, bar, 2.5);
+        PB(10, 40, 24, 24, grn2, 7);    PB(42, 44, 62, 5, bar, 2.5);  PB(42, 54, 96, 5, bar, 2.5);
+        PB(10, 70, 24, 24, purple, 7);  PB(42, 74, 62, 5, bar, 2.5);
+        NSArray *icons = @[@"bubble.fill", @"person.2.fill", @"safari.fill", @"person.fill"];
+        NSArray *names = @[@"微信", @"通讯录", @"发现", @"我"];
+        switch (st) {
+            case 0:
+                PB(10, 72, 180, 38, W1, 19);
+                for (int i = 0; i < 4; i++) {
+                    UIColor *c = i == 0 ? G : S;
+                    PS(icons[i], 10 + i * 45 + 14, 76, 17, 14, 10, c);
+                    PT(names[i], 10 + i * 45, 92, 45, 10, 6, UIFontWeightMedium, c, NSTextAlignmentCenter);
+                }
+                break;
+            case 1:
+                PB(10, 74, 132, 34, W1, 17);
+                for (int i = 0; i < 4; i++) {
+                    if (i == 0) PB(10 + 4, 76, 30, 30, W5, 15);
+                    PS(icons[i], 10 + i * 33 + 8, 82, 16, 16, 9, i == 0 ? L : S);
+                }
+                PB(148, 74, 42, 34, [UIColor colorWithWhite:0.07 alpha:1], 17);
+                PS(@"plus", 160, 82, 18, 18, 11, UIColor.whiteColor);
+                break;
+            case 2:
+                PB(10, 76, 128, 32, W1, 16);
+                PB(14, 79, 32, 26, W5, 13);
+                for (int i = 0; i < 4; i++)
+                    PT(names[i], 14 + i * 31, 79, 32, 26, 7.5, i == 0 ? UIFontWeightBold : UIFontWeightMedium, i == 0 ? L : S, NSTextAlignmentCenter);
+                PB(146, 76, 32, 32, W1, 16);
+                PS(@"plus", 154, 84, 16, 16, 10, L);
+                break;
+            case 3:
+                PB(10, 78, 180, 28, WGDyn([UIColor colorWithWhite:0.86 alpha:1], [UIColor colorWithWhite:0.3 alpha:1]), 14);
+                PB(10, 78, 70, 28, [UIColor colorWithWhite:0.13 alpha:1], 14);
+                PB(52, 80, 24, 24, UIColor.whiteColor, 12);
+                PS(@"bubble.fill", 57, 85, 14, 14, 8, [UIColor blackColor]);
+                break;
+            case 4:
+                PB(10, 54, 180, 56, W1, 20);
+                PB(26, 60, 28, 14, L, 7);
+                PT(@"全部", 26, 60, 28, 14, 7, UIFontWeightMedium, UIColor.systemBackgroundColor, NSTextAlignmentCenter);
+                PT(@"未读", 62, 60, 28, 14, 7, UIFontWeightMedium, S, NSTextAlignmentCenter);
+                PT(@"群聊", 98, 60, 28, 14, 7, UIFontWeightMedium, S, NSTextAlignmentCenter);
+                PT(@"工作", 134, 60, 28, 14, 7, UIFontWeightMedium, S, NSTextAlignmentCenter);
+                for (int i = 0; i < 4; i++) PS(icons[i], 10 + i * 45 + 14, 84, 17, 16, 10, i == 0 ? G : S);
+                break;
+            default:
+                PB(10, 74, 180, 34, W1, 17);
+                PB(14, 77, 60, 28, [UIColor colorWithWhite:0.07 alpha:1], 14);
+                PS(@"bubble.fill", 22, 83, 14, 14, 8, UIColor.whiteColor);
+                PT(@"微信", 38, 77, 32, 28, 8, UIFontWeightBold, UIColor.whiteColor, NSTextAlignmentLeft);
+                for (int i = 1; i < 4; i++) PS(icons[i], 62 + i * 33 + 8, 82, 16, 16, 9, S);
+                break;
+        }
+    }
+    return v;
+}
+
+#pragma mark - 样式选择页(像参考图:点卡片即切换)
+
+@interface WGStylePickerVC : UIViewController
+- (instancetype)initWithKind:(NSInteger)kind;
+@end
+
+@implementation WGStylePickerVC {
+    NSInteger _kind;
+    UIScrollView *_sv;
+    CGFloat _builtW;
+    NSMutableArray<UIControl *> *_cards;
+    NSMutableArray<UIImageView *> *_radios;
+}
+
+- (instancetype)initWithKind:(NSInteger)kind {
+    if (!(self = [super initWithNibName:nil bundle:nil])) return nil;
+    _kind = kind;
+    return self;
+}
+
+- (NSString *)key { return _kind == 0 ? @"topStyle" : @"botStyle"; }
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = _kind == 0 ? @"顶栏样式" : @"底栏样式";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+    _sv = [UIScrollView new];
+    _sv.alwaysBounceVertical = YES;
+    [self.view addSubview:_sv];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    _sv.frame = self.view.bounds;
+    if (fabs(_builtW - self.view.bounds.size.width) > 0.5) [self rebuild];
+}
+
+- (void)rebuild {
+    _builtW = self.view.bounds.size.width;
+    for (UIView *v in [_sv.subviews copy]) [v removeFromSuperview];
+    _cards = [NSMutableArray array]; _radios = [NSMutableArray array];
+    CGFloat W = _builtW, m = 16, gap = 12, cw = floor((W - m * 2 - gap) / 2), ph = round(cw * 0.59);
+    CGFloat y = 16;
+
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(m + 4, y, W - m * 2, 22)];
+    hint.text = @"点一张卡片就换成那个样式";
+    hint.font = [UIFont systemFontOfSize:15];
+    hint.textColor = UIColor.secondaryLabelColor;
+    [_sv addSubview:hint];
+    y += 34;
+
+    if (_kind == 1) {
+        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(m, y, W - m * 2, 48)];
+        row.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+        row.layer.cornerRadius = 12;
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, 0, W - 120, 48)];
+        l.text = @"使用悬浮底栏(关闭=微信原版)";
+        l.font = [UIFont systemFontOfSize:15];
+        [row addSubview:l];
+        UISwitch *sw = [UISwitch new];
+        sw.on = [WGD() boolForKey:@"botOn"];
+        sw.center = CGPointMake(row.bounds.size.width - 14 - sw.bounds.size.width / 2, 24);
+        [sw addTarget:self action:@selector(botSwitch:) forControlEvents:UIControlEventValueChanged];
+        [row addSubview:sw];
+        [_sv addSubview:row];
+        y += 62;
+    }
+
+    NSArray *names = _kind == 0 ? WGTopNames() : WGBotNames();
+    NSInteger cur = [WGD() integerForKey:[self key]];
+    for (NSUInteger i = 0; i < names.count; i++) {
+        CGFloat x = m + (i % 2) * (cw + gap), cy = y + (i / 2) * (ph + 54);
+        UIControl *card = [[UIControl alloc] initWithFrame:CGRectMake(x, cy, cw, ph)];
+        card.tag = (NSInteger)i;
+        card.layer.cornerRadius = 22;
+        card.layer.cornerCurve = kCACornerCurveContinuous;
+        card.layer.borderColor = WGGreen().CGColor;
+        UIView *pv = WGMakePreview(_kind, (NSInteger)i, CGSizeMake(cw, ph));
+        pv.userInteractionEnabled = NO;
+        [card addSubview:pv];
+        [card addTarget:self action:@selector(cardTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [_sv addSubview:card];
+        [_cards addObject:card];
+
+        UIImageView *rd = [[UIImageView alloc] initWithFrame:CGRectMake(x + 6, cy + ph + 10, 26, 26)];
+        rd.contentMode = UIViewContentModeScaleAspectFit;
+        [_sv addSubview:rd];
+        [_radios addObject:rd];
+        UILabel *nm = [[UILabel alloc] initWithFrame:CGRectMake(x + 40, cy + ph + 8, cw - 44, 30)];
+        nm.text = names[i];
+        nm.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
+        [_sv addSubview:nm];
+    }
+    y += ((names.count + 1) / 2) * (ph + 54);
+
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(m + 4, y + 4, W - m * 2 - 8, 10)];
+    note.numberOfLines = 0;
+    note.font = [UIFont systemFontOfSize:13];
+    note.textColor = UIColor.secondaryLabelColor;
+    note.text = _kind == 0
+        ? @"右上角的三横杠 / 「···」会打开对方的个人资料(群聊时打开聊天详情)。\n顶栏背景默认透明;名称可以在设置面板的「聊天顶栏文字」里修改。\n材质(液态玻璃 / 毛玻璃 / 叠加)在设置面板的「玻璃材质」里选。"
+        : @"点底栏图标或在底栏上滑动都可以切换页面。\n「双层分组」上方的分组标签目前只是外观,不会过滤会话。\n材质(液态玻璃 / 毛玻璃 / 叠加)在设置面板的「玻璃材质」里选。";
+    [note sizeToFit];
+    CGRect nf = note.frame; nf.size.width = W - m * 2 - 8; note.frame = nf;
+    CGSize ns = [note sizeThatFits:CGSizeMake(W - m * 2 - 8, CGFLOAT_MAX)];
+    note.frame = CGRectMake(m + 4, y + 4, W - m * 2 - 8, ns.height);
+    [_sv addSubview:note];
+    _sv.contentSize = CGSizeMake(W, y + ns.height + 60);
+    [self refreshSel];
+    (void)cur;
+}
+
+- (void)refreshSel {
+    NSInteger cur = [WGD() integerForKey:[self key]];
+    for (NSUInteger i = 0; i < _cards.count; i++) {
+        BOOL on = (NSInteger)i == cur;
+        _cards[i].layer.borderWidth = on ? 3 : 0;
+        UIImageSymbolConfiguration *c = [UIImageSymbolConfiguration configurationWithPointSize:24 weight:UIImageSymbolWeightRegular];
+        _radios[i].image = [UIImage systemImageNamed:on ? @"checkmark.circle.fill" : @"circle" withConfiguration:c];
+        _radios[i].tintColor = on ? WGGreen() : UIColor.tertiaryLabelColor;
+    }
+}
+
+- (void)cardTapped:(UIControl *)c {
+    [WGD() setInteger:c.tag forKey:[self key]];
+    [self refreshSel];
+    WGRefreshAll();
+}
+
+- (void)botSwitch:(UISwitch *)s {
+    [WGD() setBool:s.on forKey:@"botOn"];
+    WGRefreshAll();
+}
+@end
+
+#pragma mark - 设置面板
+
+@interface WGPanelVC : UITableViewController <UITextFieldDelegate>
+@end
+
+@implementation WGPanelVC {
+    NSArray<NSDictionary *> *_secs;
+}
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"WCGlass";
+    self.tableView.keyboardDismissMode = UITableViewKeyboardDismissModeOnDrag;
+    _secs = @[
+        @{@"h": @"样式", @"rows": @[
+            @{@"t": @"聊天顶栏样式", @"y": @"nt"},
+            @{@"t": @"首页底栏样式", @"y": @"nb"}]},
+        @{@"h": @"聊天顶栏文字", @"f": @"主名称留空=显示聊天对象名。第二文字:Pins 胶囊里是右侧分段(默认「详情」),标题胶囊 / 仿TIM / 名签竖线里是副标题(留空不显示)。", @"rows": @[
+            @{@"t": @"主名称", @"k": @"segLeft", @"y": @"tx", @"p": @"留空=聊天对象名"},
+            @{@"t": @"第二文字", @"k": @"segRight", @"y": @"tx", @"p": @"留空=默认"}]},
+        @{@"h": @"功能", @"f": @"顶栏默认透明底;如果原来的顶栏还透出来,打开「顶栏显示底板」。", @"rows": @[
+            @{@"t": @"悬浮底栏", @"k": @"botOn", @"y": @"sw"},
+            @{@"t": @"输入框玻璃", @"k": @"glassInput", @"y": @"sw"},
+            @{@"t": @"侧滑侧边栏", @"k": @"drawer", @"y": @"sw"},
+            @{@"t": @"顶栏显示底板", @"k": @"topCover", @"y": @"sw"}]},
+        @{@"h": @"玻璃材质", @"f": @"液态玻璃需要 iOS 26,系统不支持时自动用毛玻璃。「叠加」是毛玻璃上再叠一层液态玻璃。白度只对毛玻璃和叠加生效。", @"rows": @[
+            @{@"t": @"材质", @"k": @"glassMode", @"y": @"sg", @"o": @[@"液态", @"毛玻璃", @"叠加"]},
+            @{@"t": @"白度", @"k": @"tint", @"y": @"sl"}]},
+        @{@"h": @"通用", @"rows": @[
+            @{@"t": @"语言(侧边栏/底栏)", @"k": @"lang", @"y": @"sg", @"o": @[@"中文", @"English"]},
+            @{@"t": @"主题", @"k": @"theme", @"y": @"sg", @"o": @[@"系统", @"浅色", @"深色"]}]},
+        @{@"h": @"工具", @"rows": @[
+            @{@"t": @"立即诊断(复制到剪贴板)", @"y": @"b0"},
+            @{@"t": @"8秒后诊断(切到聊天页用)", @"y": @"b1"},
+            @{@"t": @"恢复默认设置", @"y": @"b2"}]}];
+}
+
+- (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.tableView reloadData]; }
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)t { return _secs.count; }
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return [_secs[s][@"rows"] count]; }
+- (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s { return _secs[s][@"h"]; }
+- (NSString *)tableView:(UITableView *)t titleForFooterInSection:(NSInteger)s { return _secs[s][@"f"]; }
+
+- (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
+    NSDictionary *d = _secs[ip.section][@"rows"][ip.row];
+    NSString *y = d[@"y"], *k = d[@"k"];
+    BOOL nav = [y isEqualToString:@"nt"] || [y isEqualToString:@"nb"];
+    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:nav ? UITableViewCellStyleValue1 : UITableViewCellStyleDefault reuseIdentifier:nil];
+    c.textLabel.text = d[@"t"];
+    c.textLabel.numberOfLines = 2;
+    c.selectionStyle = UITableViewCellSelectionStyleNone;
+    if (nav) {
+        BOOL top = [y isEqualToString:@"nt"];
+        NSArray *names = top ? WGTopNames() : WGBotNames();
+        NSInteger i = [WGD() integerForKey:top ? @"topStyle" : @"botStyle"];
+        c.detailTextLabel.text = (i >= 0 && i < (NSInteger)names.count) ? names[i] : @"";
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        c.selectionStyle = UITableViewCellSelectionStyleDefault;
+    } else if ([y isEqualToString:@"sw"]) {
+        UISwitch *sw = [UISwitch new];
+        sw.on = [WGD() boolForKey:k];
+        sw.accessibilityIdentifier = k;
+        [sw addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sw;
+    } else if ([y isEqualToString:@"sg"]) {
+        NSArray *o = d[@"o"];
+        UISegmentedControl *sc = [[UISegmentedControl alloc] initWithItems:o];
+        sc.frame = CGRectMake(0, 0, MAX(130, o.count * 62), 30);
+        sc.selectedSegmentIndex = [WGD() integerForKey:k];
+        sc.accessibilityIdentifier = k;
+        [sc addTarget:self action:@selector(sgChanged:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sc;
+    } else if ([y isEqualToString:@"sl"]) {
+        UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(0, 0, 150, 30)];
+        sl.minimumValue = 0; sl.maximumValue = 0.8;
+        sl.value = [WGD() floatForKey:k];
+        sl.continuous = NO;
+        sl.accessibilityIdentifier = k;
+        [sl addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sl;
+    } else if ([y isEqualToString:@"tx"]) {
+        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 170, 34)];
+        tf.placeholder = d[@"p"];
+        tf.text = [WGD() stringForKey:k];
+        tf.textAlignment = NSTextAlignmentRight;
+        tf.returnKeyType = UIReturnKeyDone;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        tf.delegate = self;
+        tf.accessibilityIdentifier = k;
+        [tf addTarget:self action:@selector(txDone:) forControlEvents:UIControlEventEditingDidEnd];
+        c.accessoryView = tf;
+    } else {
+        c.selectionStyle = UITableViewCellSelectionStyleDefault;
+        c.textLabel.textColor = [y isEqualToString:@"b2"] ? UIColor.systemRedColor : UIColor.labelColor;
     }
     return c;
 }
 
-- (void)swChanged:(UISwitch *)s { [WGD() setBool:s.on forKey:s.accessibilityIdentifier]; [gTab.view setNeedsLayout]; }
-- (void)segChanged:(UISegmentedControl *)s { [WGD() setInteger:s.selectedSegmentIndex forKey:@"tabStyle"]; [gTab.view setNeedsLayout]; [gTab.view layoutIfNeeded]; }
+- (void)swChanged:(UISwitch *)s { [WGD() setBool:s.on forKey:s.accessibilityIdentifier]; WGRefreshAll(); }
+- (void)sgChanged:(UISegmentedControl *)s { [WGD() setInteger:s.selectedSegmentIndex forKey:s.accessibilityIdentifier]; WGRefreshAll(); }
+- (void)slChanged:(UISlider *)s { [WGD() setFloat:s.value forKey:s.accessibilityIdentifier]; WGRefreshAll(); }
+- (void)txDone:(UITextField *)t { [WGD() setObject:(t.text ?: @"") forKey:t.accessibilityIdentifier]; }
+- (BOOL)textFieldShouldReturn:(UITextField *)t { [t resignFirstResponder]; return YES; }
 
 - (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [t deselectRowAtIndexPath:ip animated:YES];
-    if (ip.section != 1) return;
-    if (ip.row == 0) {
+    NSString *y = _secs[ip.section][@"rows"][ip.row][@"y"];
+    if ([y isEqualToString:@"nt"]) {
+        [self.navigationController pushViewController:[[WGStylePickerVC alloc] initWithKind:0] animated:YES];
+    } else if ([y isEqualToString:@"nb"]) {
+        [self.navigationController pushViewController:[[WGStylePickerVC alloc] initWithKind:1] animated:YES];
+    } else if ([y isEqualToString:@"b0"]) {
         WGShowDiag();
-    } else if (ip.row == 1) {
+    } else if ([y isEqualToString:@"b1"]) {
         [t cellForRowAtIndexPath:ip].textLabel.text = @"计时中…请在8秒内切到目标页面";
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ WGShowDiag(); });
-    } else {
-        for (NSString *k in @[@"glassTop", @"glassInput", @"tabStyle", @"drawer", @"theme"]) [WGD() removeObjectForKey:k];
+    } else if ([y isEqualToString:@"b2"]) {
+        for (NSString *k in @[@"topStyle", @"botStyle", @"botOn", @"glassInput", @"drawer", @"theme", @"lang", @"glassMode", @"tint", @"topCover", @"segLeft", @"segRight", @"chipSel"])
+            [WGD() removeObjectForKey:k];
         [t reloadData];
-        [gTab.view setNeedsLayout];
+        WGRefreshAll();
     }
 }
 @end
@@ -763,6 +1483,7 @@ static void WGCleanupChatTop(UIViewController *vc) {
     [tb removeFromSuperview];
     gTopBar = nil;
     UINavigationBar *nb = vc.navigationController.navigationBar;
+    nb.alpha = 1;
     for (UIView *sv in nb.subviews) sv.alpha = 1;
 }
 
@@ -783,16 +1504,74 @@ static void WGTriggerRight(UIViewController *vc) {
     [best sendActionsForControlEvents:UIControlEventTouchUpInside];
 }
 
+static id WGContactOf(UIViewController *vc) {
+    id contact = nil;
+    for (NSString *k in @[@"m_contact", @"m_oContact", @"contact"]) {
+        @try { contact = [vc valueForKey:k]; } @catch (__unused NSException *e) {}
+        if (contact) return contact;
+    }
+    for (NSString *n in @[@"GetContact", @"getContact"]) {
+        SEL sel = NSSelectorFromString(n);
+        if ([vc respondsToSelector:sel]) { contact = ((id(*)(id, SEL))objc_msgSend)(vc, sel); if (contact) return contact; }
+    }
+    NSString *un = nil;
+    for (NSString *k in @[@"m_nsUsrName", @"m_chatName", @"m_nsChatName", @"chatName"]) {
+        @try { id v = [vc valueForKey:k]; if ([v isKindOfClass:NSString.class] && [v length]) { un = v; break; } } @catch (__unused NSException *e) {}
+    }
+    if (un.length) {
+        @try {
+            id center = ((id(*)(id, SEL))objc_msgSend)(objc_getClass("MMServiceCenter"), NSSelectorFromString(@"defaultCenter"));
+            id mgr = ((id(*)(id, SEL, Class))objc_msgSend)(center, NSSelectorFromString(@"getService:"), objc_getClass("CContactMgr"));
+            contact = ((id(*)(id, SEL, id))objc_msgSend)(mgr, NSSelectorFromString(@"getContactByName:"), un);
+        } @catch (__unused NSException *e) {}
+    }
+    return contact;
+}
+
+static void WGLoadAvatar(UIViewController *vc, WGTopBar *tb) {
+    id contact = WGContactOf(vc);
+    NSString *url = nil;
+    @try { url = [contact valueForKey:@"m_nsHeadImgUrl"]; } @catch (__unused NSException *e) {}
+    if (![url isKindOfClass:NSString.class] || !url.length) return;
+    NSURL *u = [NSURL URLWithString:url];
+    if (!u) return;
+    __weak WGTopBar *w = tb;
+    [[[NSURLSession sharedSession] dataTaskWithURL:u completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        UIImage *img = d ? [UIImage imageWithData:d] : nil;
+        if (img) dispatch_async(dispatch_get_main_queue(), ^{ w.avatar = img; });
+    }] resume];
+}
+
+static void WGOpenProfile(UIViewController *vc) {
+    id contact = WGContactOf(vc);
+    NSString *uname = nil;
+    @try { uname = [contact valueForKey:@"m_nsUsrName"]; } @catch (__unused NSException *e) {}
+    BOOL isRoom = [uname hasSuffix:@"@chatroom"];
+    Class ic = NSClassFromString(@"ContactInfoViewController");
+    if (contact && !isRoom && ic) {
+        @try {
+            id info = [[ic alloc] init];
+            SEL set = NSSelectorFromString(@"setM_contact:");
+            if ([info respondsToSelector:set]) ((void(*)(id, SEL, id))objc_msgSend)(info, set, contact);
+            else [info setValue:contact forKey:@"m_contact"];
+            [vc.navigationController pushViewController:info animated:YES];
+            return;
+        } @catch (__unused NSException *e) {}
+    }
+    WGTriggerRight(vc);   // 群聊或拿不到联系人时,退回原来的右上角按钮(聊天详情)
+}
+
 static void WGApplyChat(UIViewController *vc) {
     if (!vc.isViewLoaded) return;
     UIView *root = vc.view;
 
-    // ---- 顶栏:返回胶囊 + 分段胶囊 + 菜单圆钮(挂在 window 最上层,不受微信导航栏层级影响) ----
+    // ---- 顶栏(挂在 window 最上层,不受微信导航栏层级影响) ----
+    NSInteger ts = [WGD() integerForKey:@"topStyle"];
     UINavigationBar *nb = vc.navigationController.navigationBar;
     UIWindow *win = vc.view.window;
-    BOOL wantTop = [WGD() boolForKey:@"glassTop"];
+    BOOL wantTop = ts > 0;
     BOOL onTop = vc.navigationController.topViewController == vc;
-    gTopInfo = [NSString stringWithFormat:@"顶栏: on=%d nb=%@ win=%d onTop=%d", wantTop, nb ? NSStringFromClass(nb.class) : @"nil", win != nil, onTop];
+    gTopInfo = [NSString stringWithFormat:@"顶栏: style=%ld nb=%@ win=%d onTop=%d", (long)ts, nb ? NSStringFromClass(nb.class) : @"nil", win != nil, onTop];
     if (wantTop && nb && win && onTop && !nb.hidden) {
         NSString *title = vc.navigationItem.title ?: vc.title;
         if (!title.length) {
@@ -809,22 +1588,48 @@ static void WGApplyChat(UIViewController *vc) {
             });
             title = best.text;
         }
+        NSString *unread = nil;
+        if (ts == 3) {   // 仿 TIM:返回键旁显示未读数(取原导航栏左侧的数字)
+            __block NSString *cnt = nil;
+            WGFind(nb, ^BOOL(UIView *v) {
+                if ([v isKindOfClass:UILabel.class]) {
+                    NSString *t = ((UILabel *)v).text;
+                    if (t.length > 0 && t.length <= 5 && [nb convertRect:v.bounds fromView:v].origin.x < nb.bounds.size.width * 0.4) {
+                        NSString *d = [[t componentsSeparatedByCharactersInSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet] componentsJoinedByString:@""];
+                        if (d.length > 0) cnt = d;
+                    }
+                }
+                return NO;
+            });
+            unread = cnt;
+        }
         WGTopBar *tb = (WGTopBar *)gTopBar;
         if (!tb) {
             tb = [WGTopBar new];
             __weak UIViewController *wvc = vc;
             tb.onBack = ^{ [wvc.navigationController popViewControllerAnimated:YES]; };
             tb.onInfo = ^{ WGTriggerRight(wvc); };
+            tb.onMenu = ^{ WGOpenProfile(wvc); };
             gTopBar = tb;
+            WGLoadAvatar(vc, tb);
         }
         if (tb.superview != win) [win addSubview:tb];
+        tb.customLeft = [WGD() stringForKey:@"segLeft"];
+        tb.customRight = [WGD() stringForKey:@"segRight"];
+        tb.backText = unread;
         if (title.length) tb.title = title;
-        UIColor *bg = vc.view.backgroundColor;
-        if (!bg || CGColorGetAlpha(bg.CGColor) < 0.5) bg = UIColor.systemBackgroundColor;
-        tb.coverColor = bg;
+        tb.style = ts;
+        if ([WGD() boolForKey:@"topCover"]) {
+            UIColor *bg = vc.view.backgroundColor;
+            if (!bg || CGColorGetAlpha(bg.CGColor) < 0.5) bg = UIColor.systemBackgroundColor;
+            tb.coverColor = bg;
+        } else {
+            tb.coverColor = nil;   // 透明底
+        }
         tb.frame = [win convertRect:nb.bounds fromView:nb];
         [win bringSubviewToFront:tb];
         nb.backgroundColor = UIColor.clearColor;
+        nb.alpha = 0;
         for (UIView *sv in nb.subviews) sv.alpha = 0;
         gTopInfo = [gTopInfo stringByAppendingFormat:@" tb=%@", NSStringFromCGRect(tb.frame)];
     } else {
@@ -915,14 +1720,15 @@ static void WGApplyTab(UIViewController *tc) {
     if (root.window && (NSInteger)root.window.overrideUserInterfaceStyle != theme)
         root.window.overrideUserInterfaceStyle = (UIUserInterfaceStyle)theme;
 
-    NSInteger style = [WGD() integerForKey:@"tabStyle"];
+    BOOL on = [WGD() boolForKey:@"botOn"];
+    NSInteger st = MAX(0, MIN(5, [WGD() integerForKey:@"botStyle"]));
     UIView *bar = gTabBar;
     if (!bar || ![bar isDescendantOfView:root]) { bar = WGFindTabBar(root); gTabBar = bar; }
 
     WGTabView *tv = (WGTabView *)[root viewWithTag:TAG_GLASS_TAB];
     UIButton *plus = (UIButton *)[root viewWithTag:TAG_TAB_PLUS];
 
-    if (style == 0 || !bar) {
+    if (!on || !bar) {
         [tv removeFromSuperview]; [plus removeFromSuperview];
         for (UIView *sv in bar.subviews) sv.alpha = 1;
         return;
@@ -932,9 +1738,10 @@ static void WGApplyTab(UIViewController *tc) {
     if (gone) return;
 
     CGFloat W = root.bounds.size.width, H = root.bounds.size.height;
-    CGFloat h = 64, m = 14, plusSize = h;
+    CGFloat h = [WGTabView heightForStyle:st], m = 14, plusSize = 56;
+    BOOL hasPlus = (st == 1 || st == 2);
     CGFloat y = H - MAX(root.safeAreaInsets.bottom, 10) - h;
-    CGFloat cw = style == 1 ? W - m * 3 - plusSize : W - m * 2;
+    CGFloat cw = hasPlus ? W - m * 3 - plusSize : W - m * 2;
 
     if (!tv) {
         tv = [WGTabView new];
@@ -953,6 +1760,7 @@ static void WGApplyTab(UIViewController *tc) {
         };
         [tv setSelected:MAX(WGCurrentIndex(tc, WGItemsOf(bar)), 0) animated:NO];
     }
+    tv.style = st;
     [root bringSubviewToFront:tv];
     tv.frame = CGRectMake(m, y, cw, h);
 
@@ -960,23 +1768,23 @@ static void WGApplyTab(UIViewController *tc) {
     bar.backgroundColor = UIColor.clearColor;
     for (UIView *sv in bar.subviews) sv.alpha = 0;
 
-    if (style == 1) {
+    if (hasPlus) {
         if (!plus) {
             plus = [UIButton buttonWithType:UIButtonTypeSystem];
             plus.tag = TAG_TAB_PLUS;
-            plus.backgroundColor = UIColor.blackColor;
-            plus.tintColor = UIColor.whiteColor;
-            [plus setImage:[UIImage systemImageNamed:@"plus" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:24 weight:UIImageSymbolWeightMedium]] forState:UIControlStateNormal];
             [plus addTarget:WGHelper.shared action:@selector(plusTapped) forControlEvents:UIControlEventTouchUpInside];
         }
+        plus.backgroundColor = st == 1 ? UIColor.blackColor : WGDyn([UIColor colorWithWhite:1 alpha:0.95], [UIColor colorWithWhite:1 alpha:0.2]);
+        plus.tintColor = st == 1 ? UIColor.whiteColor : UIColor.labelColor;
+        [plus setImage:[UIImage systemImageNamed:@"plus" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightMedium]] forState:UIControlStateNormal];
         if (plus.superview != root) [root addSubview:plus];
         [root bringSubviewToFront:plus];
-        plus.frame = CGRectMake(W - m - plusSize, y, plusSize, plusSize);
+        plus.frame = CGRectMake(W - m - plusSize, y + (h - plusSize) / 2, plusSize, plusSize);
         plus.layer.cornerRadius = plusSize / 2;
         plus.layer.shadowColor = UIColor.blackColor.CGColor;
-        plus.layer.shadowOpacity = 0.25;
-        plus.layer.shadowRadius = 10;
-        plus.layer.shadowOffset = CGSizeMake(0, 4);
+        plus.layer.shadowOpacity = 0.2;
+        plus.layer.shadowRadius = 8;
+        plus.layer.shadowOffset = CGSizeMake(0, 3);
     } else {
         [plus removeFromSuperview];
     }
