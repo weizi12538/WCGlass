@@ -1193,10 +1193,11 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
             @{@"t": @"首页底栏", @"k": @"botOn", @"y": @"sw"},
             @{@"t": @"输入框玻璃", @"k": @"glassInput", @"y": @"sw"},
             @{@"t": @"侧滑侧边栏", @"k": @"drawer", @"y": @"sw"}]},
-        @{@"h": @"一键分工", @"rows": @[
+        @{@"h": @"一键分工", @"f": @"选一个预设,上面「由 WCGlass 负责的功能」的开关会自动对应。没负责的功能请在 LiquidUI 里自己开启。", @"rows": @[
             @{@"t": @"全部由 WCGlass 负责", @"y": @"p0"},
+            @{@"t": @"侧边栏 + 顶栏 + 输入框一起用(底栏交给 LiquidUI)", @"y": @"p2"},
             @{@"t": @"只做底栏 + 侧边栏(顶栏、输入框交给 LiquidUI)", @"y": @"p1"},
-            @{@"t": @"只做顶栏 + 输入框(底栏交给 LiquidUI)", @"y": @"p2"},
+            @{@"t": @"只做顶栏 + 输入框(底栏、侧边栏不用)", @"y": @"p4"},
             @{@"t": @"WCGlass 全部暂停(全交给 LiquidUI)", @"y": @"p3"}]},
         @{@"h": @"样式", @"rows": @[
             @{@"t": @"聊天顶栏样式", @"y": @"nt"},
@@ -1304,7 +1305,8 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
     } else if ([y isEqualToString:@"nb"]) {
         [self.navigationController pushViewController:[[WGStylePickerVC alloc] initWithKind:1] animated:YES];
     } else if ([y hasPrefix:@"p"] && y.length == 2) {
-        static const BOOL presets[4][4] = {{1, 1, 1, 1}, {0, 1, 0, 1}, {1, 0, 1, 1}, {0, 0, 0, 0}};
+        // 顺序: 聊天顶栏, 首页底栏, 输入框, 侧边栏
+        static const BOOL presets[5][4] = {{1, 1, 1, 1}, {0, 1, 0, 1}, {1, 0, 1, 1}, {0, 0, 0, 0}, {1, 0, 1, 0}};
         int idx = [[y substringFromIndex:1] intValue];
         NSArray *keys = @[@"topOn", @"botOn", @"glassInput", @"drawer"];
         for (int i = 0; i < 4; i++) [WGD() setBool:presets[idx][i] forKey:keys[i]];
