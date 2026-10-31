@@ -22,6 +22,12 @@ static NSString *gTopInfo;
 static BOOL gBarTouched;
 static int gCntEdge;
 static NSString *gEdgeWhy;
+
+@interface WGHelper : NSObject <UIGestureRecognizerDelegate>
++ (instancetype)shared;
+- (void)openDrawer;
+@end
+
 static UIViewController *WGVisibleVC(void);
 static BOOL WGHomeVisible(void);
 static int gCntChat, gCntTab;
@@ -1352,9 +1358,6 @@ static BOOL WGHomeVisible(void) {
 
 #pragma mark - Helper(侧边栏 / 按钮事件)
 
-@interface WGHelper : NSObject <UIGestureRecognizerDelegate>
-+ (instancetype)shared;
-@end
 
 @implementation WGHelper
 + (instancetype)shared { static WGHelper *h; static dispatch_once_t t; dispatch_once(&t, ^{ h = [WGHelper new]; }); return h; }
