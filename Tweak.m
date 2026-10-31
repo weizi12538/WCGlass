@@ -22,6 +22,7 @@ static NSString *gTopInfo;
 static BOOL gBarTouched;
 static int gCntEdge;
 static NSString *gEdgeWhy;
+static UIWindow *gOverlay;   // 侧边栏专用窗口(盖在其他插件的视图和窗口之上)
 
 @interface WGHelper : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
@@ -794,7 +795,7 @@ static NSString *WGDiagnose(void) {
     [s appendFormat:@"触发次数: chat=%d tab=%d\n", gCntChat, gCntTab];
     [s appendFormat:@"%@\n", gTopInfo ?: @"顶栏: 还没执行过"];
     [s appendFormat:@"同类插件: %@\n", WGOtherTweaks().length ? WGOtherTweaks() : @"未检测到"];
-    [s appendFormat:@"侧边栏手势: 触发%d次 最近结果=%@ 在首页=%d\n", gCntEdge, gEdgeWhy ?: @"无", WGHomeVisible()];
+    [s appendFormat:@"侧边栏手势: 触发%d次 最近结果=%@ 在首页=%d 找到TabVC=%d 窗口=%d\n", gCntEdge, gEdgeWhy ?: @"无", WGHomeVisible(), gTab != nil, gOverlay != nil];
     [s appendFormat:@"类存在: MMTabBarController=%d BaseMsgContent=%d\n",
         NSClassFromString(@"MMTabBarController") != nil, NSClassFromString(@"BaseMsgContentViewController") != nil];
     UIWindow *w = WGWindow();
@@ -1324,7 +1325,14 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
         [t reloadData];
         WGRefreshAll();
     } else if ([y isEqualToString:@"b3"]) {
+        gEdgeWhy = nil;
         [WGHelper.shared openDrawer];
+        if (![gOverlay.rootViewController.view viewWithTag:TAG_DRAWER]) {
+            UIAlertController *al = [UIAlertController alertControllerWithTitle:@"没能打开侧边栏"
+                message:gEdgeWhy ?: @"未知原因(请再点一次「立即诊断」截图发我)" preferredStyle:UIAlertControllerStyleAlert];
+            [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:al animated:YES completion:nil];
+        }
     } else if ([y isEqualToString:@"b0"]) {
         WGShowDiag();
     } else if ([y isEqualToString:@"b1"]) {
@@ -1339,8 +1347,25 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
 }
 @end
 
+// 不依赖钩子:直接从窗口里找微信的主 TabBar 控制器
+static UIViewController *WGFindTabController(void) {
+    UIViewController *root = WGWindow().rootViewController;
+    NSMutableArray<UIViewController *> *queue = [NSMutableArray array];
+    if (root) [queue addObject:root];
+    for (NSUInteger i = 0; i < queue.count && i < 40; i++) {
+        UIViewController *v = queue[i];
+        NSString *n = NSStringFromClass(v.class);
+        if (![v isKindOfClass:UINavigationController.class] && [n containsString:@"TabBarController"]) return v;
+        if (![v isKindOfClass:UINavigationController.class] && [n containsString:@"TabBarViewController"]) return v;
+        if (v.presentedViewController) [queue addObject:v.presentedViewController];
+        [queue addObjectsFromArray:v.childViewControllers];
+    }
+    return nil;
+}
+
 // 当前是不是停在首页(没有二级页面被推入)。用于判断要不要响应侧边栏手势
 static BOOL WGHomeVisible(void) {
+    if (!gTab) gTab = WGFindTabController();
     UIViewController *tc = gTab;
     if (!tc.isViewLoaded || !tc.view.window) return NO;
     UIView *bar = gTabBar;
@@ -1354,6 +1379,24 @@ static BOOL WGHomeVisible(void) {
             && ((UINavigationController *)c).viewControllers.count > 1) return NO;
     }
     return YES;
+}
+
+// 侧边栏放在自己的窗口里,层级高于其他插件加的视图
+static UIView *WGDrawerHost(void) {
+    if (!gOverlay) {
+        UIWindowScene *sc = WGWindow().windowScene;
+        if (!sc) for (UIScene *x in UIApplication.sharedApplication.connectedScenes)
+            if ([x isKindOfClass:UIWindowScene.class]) { sc = (UIWindowScene *)x; break; }
+        gOverlay = sc ? [[UIWindow alloc] initWithWindowScene:sc] : [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        gOverlay.windowLevel = UIWindowLevelAlert + 100;
+        gOverlay.backgroundColor = UIColor.clearColor;
+        UIViewController *vc = [UIViewController new];
+        vc.view.backgroundColor = UIColor.clearColor;
+        gOverlay.rootViewController = vc;
+    }
+    gOverlay.hidden = NO;
+    gOverlay.rootViewController.view.frame = gOverlay.bounds;
+    return gOverlay.rootViewController.view;
 }
 
 #pragma mark - Helper(侧边栏 / 按钮事件)
@@ -1381,6 +1424,7 @@ static BOOL WGHomeVisible(void) {
     if (g.state != UIGestureRecognizerStateChanged) return;
     if ([g translationInView:g.view].x <= 40) return;
     gCntEdge++;
+    if ([gOverlay.rootViewController.view viewWithTag:TAG_DRAWER]) return;
     if (![WGD() boolForKey:@"drawer"]) { gEdgeWhy = @"侧边栏开关是关的"; return; }
     if (!WGHomeVisible()) { gEdgeWhy = @"当前不在首页"; return; }
     gEdgeWhy = @"已打开";
@@ -1421,10 +1465,13 @@ static BOOL WGHomeVisible(void) {
 }
 
 - (void)openDrawerAnimated:(BOOL)anim {
-    UIView *host = gTab.view.window ?: gTab.view;
-    if (!host || [host viewWithTag:TAG_DRAWER]) return;
+    if (!gTab) gTab = WGFindTabController();
+    UIView *host = WGDrawerHost();
+    if ([host viewWithTag:TAG_DRAWER]) { gEdgeWhy = @"侧边栏已经在显示"; return; }
+    UIWindow *mw = gTab.view.window ?: WGWindow();
     CGFloat W = host.bounds.size.width, H = host.bounds.size.height, dw = floor(W * 0.77);
-    CGFloat top = host.safeAreaInsets.top, bottom = host.safeAreaInsets.bottom;
+    CGFloat top = mw.safeAreaInsets.top, bottom = mw.safeAreaInsets.bottom;
+    if (top < 1) top = 47;
 
     UIView *dim = [[UIView alloc] initWithFrame:host.bounds];
     dim.tag = TAG_DIM;
@@ -1515,21 +1562,21 @@ static BOOL WGHomeVisible(void) {
 
 - (void)toggleLang {
     [WGD() setInteger:([WGD() integerForKey:@"lang"] == 1 ? 0 : 1) forKey:@"lang"];
-    UIView *host = gTab.view.window ?: gTab.view;
+    UIView *host = gOverlay.rootViewController.view;
     [[host viewWithTag:TAG_DRAWER] removeFromSuperview];
     [[host viewWithTag:TAG_DIM] removeFromSuperview];
-    [(WGTabView *)[host viewWithTag:TAG_GLASS_TAB] refreshTitles];
+    [(WGTabView *)[gTab.view viewWithTag:TAG_GLASS_TAB] refreshTitles];
     [self openDrawerAnimated:NO];
 }
 
 - (void)closeDrawer {
-    UIView *host = gTab.view.window ?: gTab.view;
+    UIView *host = gOverlay.rootViewController.view;
     UIView *dr = [host viewWithTag:TAG_DRAWER], *dim = [host viewWithTag:TAG_DIM];
     if (!dr) return;
     [UIView animateWithDuration:0.24 animations:^{
         dr.frame = CGRectMake(-dr.bounds.size.width, 0, dr.bounds.size.width, dr.bounds.size.height);
         dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0];
-    } completion:^(BOOL f) { [dr removeFromSuperview]; [dim removeFromSuperview]; }];
+    } completion:^(BOOL f) { [dr removeFromSuperview]; [dim removeFromSuperview]; gOverlay.hidden = YES; }];
 }
 
 - (void)drawerPan:(UIPanGestureRecognizer *)g {
@@ -1798,6 +1845,21 @@ static UIView *WGFindTabBar(UIView *root) {
     return nil;
 }
 
+static void WGInstallWindowPan(UIWindow *hw) {
+    static char kWinPan;
+    if (!hw || hw == gOverlay || objc_getAssociatedObject(hw, &kWinPan)) return;
+    NSString *cn = NSStringFromClass(hw.class);
+    if ([cn containsString:@"Keyboard"] || [cn hasPrefix:@"UIText"] || [cn containsString:@"Remote"]) return;
+    UIPanGestureRecognizer *wp = [[UIPanGestureRecognizer alloc] initWithTarget:WGHelper.shared action:@selector(edgePan2:)];
+    wp.delegate = WGHelper.shared;
+    wp.cancelsTouchesInView = NO;
+    wp.delaysTouchesBegan = NO;
+    wp.delaysTouchesEnded = NO;
+    wp.maximumNumberOfTouches = 1;
+    [hw addGestureRecognizer:wp];
+    objc_setAssociatedObject(hw, &kWinPan, wp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static void WGApplyTab(UIViewController *tc) {
     gTab = tc;
     UIView *root = tc.view;
@@ -1811,18 +1873,7 @@ static void WGApplyTab(UIViewController *tc) {
         [root addGestureRecognizer:e];
         objc_setAssociatedObject(tc, &kEdge, e, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    static char kWinPan;
-    UIWindow *hw = root.window;
-    if (hw && !objc_getAssociatedObject(hw, &kWinPan)) {
-        UIPanGestureRecognizer *wp = [[UIPanGestureRecognizer alloc] initWithTarget:WGHelper.shared action:@selector(edgePan2:)];
-        wp.delegate = WGHelper.shared;
-        wp.cancelsTouchesInView = NO;
-        wp.delaysTouchesBegan = NO;
-        wp.delaysTouchesEnded = NO;
-        wp.maximumNumberOfTouches = 1;
-        [hw addGestureRecognizer:wp];
-        objc_setAssociatedObject(hw, &kWinPan, wp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
+    WGInstallWindowPan(root.window);
     static dispatch_once_t themeOnce;   // 主题只在启动时应用一次,之后只在你手动切换时改,避免和其他插件互相抢
     dispatch_once(&themeOnce, ^{
         NSInteger theme = [WGD() integerForKey:@"theme"];
@@ -1954,6 +2005,15 @@ __attribute__((constructor)) static void WGInit(void) {
 
     gHookChat = o_chatLayout != NULL;
     gHookTab = o_tabLayout != NULL;
+
+    // 侧边栏手势不依赖底栏钩子:窗口出现时就装上
+    void (^inst)(NSNotification *) = ^(NSNotification *n) {
+        UIWindow *w = [n.object isKindOfClass:UIWindow.class] ? n.object : WGWindow();
+        WGInstallWindowPan(w);
+    };
+    for (NSNotificationName nm in @[UIWindowDidBecomeVisibleNotification, UIWindowDidBecomeKeyNotification, UIApplicationDidBecomeActiveNotification])
+        [[NSNotificationCenter defaultCenter] addObserverForName:nm object:nil queue:NSOperationQueue.mainQueue usingBlock:inst];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ WGInstallWindowPan(WGWindow()); });
 
     // 微信设置页入口
     Class st = NSClassFromString(@"NewSettingViewController");
