@@ -20,7 +20,10 @@ static __weak UIView *gTabBar;
 static __weak UIView *gTopBar;
 static NSString *gTopInfo;
 static BOOL gBarTouched;
+static int gCntEdge;
+static NSString *gEdgeWhy;
 static UIViewController *WGVisibleVC(void);
+static BOOL WGHomeVisible(void);
 static int gCntChat, gCntTab;
 static BOOL gHookChat, gHookTab, gHookSet;
 static UIView *WGFindInputBar(UIView *root);
@@ -785,6 +788,7 @@ static NSString *WGDiagnose(void) {
     [s appendFormat:@"触发次数: chat=%d tab=%d\n", gCntChat, gCntTab];
     [s appendFormat:@"%@\n", gTopInfo ?: @"顶栏: 还没执行过"];
     [s appendFormat:@"同类插件: %@\n", WGOtherTweaks().length ? WGOtherTweaks() : @"未检测到"];
+    [s appendFormat:@"侧边栏手势: 触发%d次 最近结果=%@ 在首页=%d\n", gCntEdge, gEdgeWhy ?: @"无", WGHomeVisible()];
     [s appendFormat:@"类存在: MMTabBarController=%d BaseMsgContent=%d\n",
         NSClassFromString(@"MMTabBarController") != nil, NSClassFromString(@"BaseMsgContentViewController") != nil];
     UIWindow *w = WGWindow();
@@ -1214,6 +1218,7 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
             @{@"t": @"语言(侧边栏/底栏)", @"k": @"lang", @"y": @"sg", @"o": @[@"中文", @"English"]},
             @{@"t": @"主题", @"k": @"theme", @"y": @"sg", @"o": @[@"系统", @"浅色", @"深色"]}]},
         @{@"h": @"工具", @"rows": @[
+            @{@"t": @"立即打开侧边栏(测试)", @"y": @"b3"},
             @{@"t": @"立即诊断(复制到剪贴板)", @"y": @"b0"},
             @{@"t": @"8秒后诊断(切到聊天页用)", @"y": @"b1"},
             @{@"t": @"恢复默认设置", @"y": @"b2"}]}];
@@ -1312,6 +1317,8 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
         for (int i = 0; i < 4; i++) [WGD() setBool:presets[idx][i] forKey:keys[i]];
         [t reloadData];
         WGRefreshAll();
+    } else if ([y isEqualToString:@"b3"]) {
+        [WGHelper.shared openDrawer];
     } else if ([y isEqualToString:@"b0"]) {
         WGShowDiag();
     } else if ([y isEqualToString:@"b1"]) {
@@ -1326,9 +1333,26 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
 }
 @end
 
+// 当前是不是停在首页(没有二级页面被推入)。用于判断要不要响应侧边栏手势
+static BOOL WGHomeVisible(void) {
+    UIViewController *tc = gTab;
+    if (!tc.isViewLoaded || !tc.view.window) return NO;
+    UIView *bar = gTabBar;
+    if (bar && bar.hidden) return NO;
+    NSInteger idx = WGCurrentIndex(tc, bar ? WGItemsOf(bar) : @[]);
+    NSArray<UIViewController *> *kids = tc.childViewControllers;
+    if (idx >= 0 && idx < (NSInteger)kids.count && [kids[idx] isKindOfClass:UINavigationController.class])
+        return ((UINavigationController *)kids[idx]).viewControllers.count <= 1;
+    for (UIViewController *c in kids) {
+        if ([c isKindOfClass:UINavigationController.class] && c.isViewLoaded && c.view.window && !c.view.hidden && c.view.alpha > 0.01
+            && ((UINavigationController *)c).viewControllers.count > 1) return NO;
+    }
+    return YES;
+}
+
 #pragma mark - Helper(侧边栏 / 按钮事件)
 
-@interface WGHelper : NSObject
+@interface WGHelper : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 @end
 
@@ -1350,11 +1374,30 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
     }
 }
 
-- (void)edgePan:(UIScreenEdgePanGestureRecognizer *)g {
-    if (![WGD() boolForKey:@"drawer"]) return;
-    if (WGNav().viewControllers.count > 1) return;
-    if (g.state == UIGestureRecognizerStateChanged && [g translationInView:g.view].x > 40) [self openDrawer];
+- (void)handleEdge:(UIPanGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateChanged) return;
+    if ([g translationInView:g.view].x <= 40) return;
+    gCntEdge++;
+    if (![WGD() boolForKey:@"drawer"]) { gEdgeWhy = @"侧边栏开关是关的"; return; }
+    if (!WGHomeVisible()) { gEdgeWhy = @"当前不在首页"; return; }
+    gEdgeWhy = @"已打开";
+    [self openDrawer];
 }
+- (void)edgePan:(UIScreenEdgePanGestureRecognizer *)g { [self handleEdge:g]; }
+- (void)edgePan2:(UIPanGestureRecognizer *)g { [self handleEdge:g]; }
+
+// 窗口级手势:只接收从屏幕最左边缘开始的触摸,和别的插件的手势同时识别,互不抢占
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
+    if (![g isKindOfClass:UIScreenEdgePanGestureRecognizer.class] && [g isKindOfClass:UIPanGestureRecognizer.class])
+        return [WGD() boolForKey:@"drawer"] && [t locationInView:g.view].x < 28;
+    return YES;
+}
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    if (![g isKindOfClass:UIPanGestureRecognizer.class]) return YES;
+    CGPoint v = [(UIPanGestureRecognizer *)g velocityInView:g.view];
+    return v.x > 0 && fabs(v.x) >= fabs(v.y) * 0.8;
+}
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o { return YES; }
 
 - (void)openDrawer { [self openDrawerAnimated:YES]; }
 
@@ -1375,7 +1418,7 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
 }
 
 - (void)openDrawerAnimated:(BOOL)anim {
-    UIView *host = gTab.view;
+    UIView *host = gTab.view.window ?: gTab.view;
     if (!host || [host viewWithTag:TAG_DRAWER]) return;
     CGFloat W = host.bounds.size.width, H = host.bounds.size.height, dw = floor(W * 0.77);
     CGFloat top = host.safeAreaInsets.top, bottom = host.safeAreaInsets.bottom;
@@ -1469,7 +1512,7 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
 
 - (void)toggleLang {
     [WGD() setInteger:([WGD() integerForKey:@"lang"] == 1 ? 0 : 1) forKey:@"lang"];
-    UIView *host = gTab.view;
+    UIView *host = gTab.view.window ?: gTab.view;
     [[host viewWithTag:TAG_DRAWER] removeFromSuperview];
     [[host viewWithTag:TAG_DIM] removeFromSuperview];
     [(WGTabView *)[host viewWithTag:TAG_GLASS_TAB] refreshTitles];
@@ -1477,7 +1520,7 @@ static UIView *WGMakePreview(NSInteger kind, NSInteger st, CGSize sz) {
 }
 
 - (void)closeDrawer {
-    UIView *host = gTab.view;
+    UIView *host = gTab.view.window ?: gTab.view;
     UIView *dr = [host viewWithTag:TAG_DRAWER], *dim = [host viewWithTag:TAG_DIM];
     if (!dr) return;
     [UIView animateWithDuration:0.24 animations:^{
@@ -1760,8 +1803,22 @@ static void WGApplyTab(UIViewController *tc) {
     if (!objc_getAssociatedObject(tc, &kEdge)) {
         UIScreenEdgePanGestureRecognizer *e = [[UIScreenEdgePanGestureRecognizer alloc] initWithTarget:WGHelper.shared action:@selector(edgePan:)];
         e.edges = UIRectEdgeLeft;
+        e.delegate = WGHelper.shared;
+        e.cancelsTouchesInView = NO;
         [root addGestureRecognizer:e];
         objc_setAssociatedObject(tc, &kEdge, e, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    static char kWinPan;
+    UIWindow *hw = root.window;
+    if (hw && !objc_getAssociatedObject(hw, &kWinPan)) {
+        UIPanGestureRecognizer *wp = [[UIPanGestureRecognizer alloc] initWithTarget:WGHelper.shared action:@selector(edgePan2:)];
+        wp.delegate = WGHelper.shared;
+        wp.cancelsTouchesInView = NO;
+        wp.delaysTouchesBegan = NO;
+        wp.delaysTouchesEnded = NO;
+        wp.maximumNumberOfTouches = 1;
+        [hw addGestureRecognizer:wp];
+        objc_setAssociatedObject(hw, &kWinPan, wp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     static dispatch_once_t themeOnce;   // 主题只在启动时应用一次,之后只在你手动切换时改,避免和其他插件互相抢
     dispatch_once(&themeOnce, ^{
